@@ -1,0 +1,160 @@
+name: TraceLens CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: tracelens-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect project components
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.files.outputs.rust }}
+      bpf: ${{ steps.files.outputs.bpf }}
+      ui: ${{ steps.files.outputs.ui }}
+      tauri: ${{ steps.files.outputs.tauri }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Detect project components
+        id: files
+        shell: bash
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -f CMakeLists.txt ]]; then
+            echo "bpf=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bpf=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -f ui/package.json ]]; then
+            echo "ui=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ -f ui/src-tauri/Cargo.toml ]]; then
+            echo "tauri=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tauri=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  rust:
+    name: Rust checks
+    needs: detect
+    if: needs.detect.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  bpf:
+    name: eBPF checks
+    needs: detect
+    if: needs.detect.outputs.bpf == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install eBPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            clang \
+            cmake \
+            libbpf-dev \
+            linux-libc-dev \
+            llvm
+
+      - name: Build eBPF objects
+        run: |
+          cmake -S . -B build -DTRACELENS_BUILD_BPF=ON
+          cmake --build build --parallel
+
+  ui:
+    name: UI checks
+    needs: detect
+    if: needs.detect.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+  tauri:
+    name: Tauri checks
+    needs: detect
+    if: needs.detect.outputs.tauri == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Tauri build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check Tauri backend
+        run: cargo check --manifest-path ui/src-tauri/Cargo.toml
