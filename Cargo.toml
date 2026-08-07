@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "core",
+    "crates/events",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/plsy1/TraceLens"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
