@@ -1,18 +1,13 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObservationLevel {
+    #[default]
     L1 = 1,
     L2 = 2,
     L3 = 3,
     L4 = 4,
     L5 = 5,
-}
-
-impl Default for ObservationLevel {
-    fn default() -> Self {
-        Self::L1
-    }
 }
 
 impl ObservationLevel {

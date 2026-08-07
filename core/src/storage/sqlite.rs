@@ -21,4 +21,8 @@ impl EventStore {
     pub fn len(&self) -> usize {
         self.events.lock().map(|events| events.len()).unwrap_or(0)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
