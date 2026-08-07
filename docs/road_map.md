@@ -158,7 +158,7 @@ C
 
 ---
 
-## 3.2 用户态 Agent
+## 3.2 用户态 Core
 
 语言：
 
@@ -222,7 +222,7 @@ bpftime：
 ```text
                          TraceLens
                             │
-                     Rust Security Agent
+                     Rust Security Core
                             │
           ┌─────────────────┴──────────────────┐
           │                                    │
@@ -303,77 +303,89 @@ OpenSSL
 
 ```text
 bpf/
-├── process.bpf.c
-├── network.bpf.c
-├── dns.bpf.c
-├── tcp.bpf.c
-├── file.bpf.c
-├── tls.bpf.c
-├── plaintext.bpf.c
-└── common.bpf.h
+├── kernel/
+│   ├── process.bpf.c
+│   ├── network.bpf.c
+│   ├── dns.bpf.c
+│   ├── tcp.bpf.c
+│   └── file.bpf.c
+│
+├── userspace/
+│   ├── openssl.bpf.c
+│   ├── tls.bpf.c
+│   └── plaintext.bpf.c
+│
+└── include/
+    ├── events.h
+    └── common.h
 ```
 
 ---
 
-# 7. Rust Agent 目录
+# 7. Rust Core 目录
 
 建议：
 
 ```text
-agent/
-├── main.rs
-│
-├── runtime/
-│   ├── mod.rs
-│   ├── kernel.rs
-│   ├── bpftime.rs
-│   └── selector.rs
-│
-├── observation/
-│   ├── manager.rs
-│   ├── level.rs
-│   └── target.rs
-│
-├── process/
-│   ├── tracker.rs
-│   └── model.rs
-│
-├── network/
-│   ├── connection_tracker.rs
-│   ├── socket_tracker.rs
-│   └── model.rs
-│
-├── dns/
-│   ├── tracker.rs
-│   └── cache.rs
-│
-├── tls/
-│   ├── tracker.rs
-│   └── openssl.rs
-│
-├── http/
-│   ├── parser.rs
-│   └── stream.rs
-│
-├── events/
-│   ├── model.rs
-│   ├── correlator.rs
-│   └── bus.rs
-│
-├── detection/
-│   ├── engine.rs
-│   ├── rules.rs
-│   └── risk.rs
-│
-├── storage/
-│   ├── sqlite.rs
-│   └── schema.rs
-│
-└── api/
-    ├── process.rs
-    ├── connection.rs
-    ├── alerts.rs
-    └── observation.rs
+core/
+└── src/
+    ├── main.rs
+    │
+    ├── runtime/
+    │   ├── mod.rs
+    │   ├── kernel.rs
+    │   ├── bpftime.rs
+    │   └── selector.rs
+    │
+    ├── observation/
+    │   ├── manager.rs
+    │   ├── level.rs
+    │   └── target.rs
+    │
+    ├── process/
+    │   ├── tracker.rs
+    │   └── model.rs
+    │
+    ├── network/
+    │   ├── socket.rs
+    │   ├── connection.rs
+    │   └── tracker.rs
+    │
+    ├── dns/
+    │   ├── tracker.rs
+    │   └── cache.rs
+    │
+    ├── tls/
+    │   ├── tracker.rs
+    │   └── openssl.rs
+    │
+    ├── http/
+    │   ├── parser.rs
+    │   └── stream.rs
+    │
+    ├── events/
+    │   ├── model.rs
+    │   ├── correlator.rs
+    │   └── bus.rs
+    │
+    ├── detection/
+    │   ├── engine.rs
+    │   ├── rules.rs
+    │   └── risk.rs
+    │
+    ├── storage/
+    │   ├── sqlite.rs
+    │   └── schema.rs
+    │
+    ├── api/
+    │   ├── process.rs
+    │   ├── connection.rs
+    │   ├── alerts.rs
+    │   └── observation.rs
+    │
+    └── lib.rs
+
+Cargo.toml
 ```
 
 ---
@@ -837,7 +849,7 @@ Attach SSL_read / SSL_write
 
 # 18. TLS Library Detection
 
-用户态 Agent 需要检查：
+用户态 Core 需要检查：
 
 ```text
 /proc/<pid>/maps
@@ -1011,7 +1023,7 @@ SSL_read #3
 Body
 ```
 
-因此 Agent 需要：
+因此 Core 需要：
 
 Connection Stream Buffer
 
@@ -1799,7 +1811,7 @@ Alert
 
 # 51. Event Correlation
 
-Event Correlator 是 Agent 核心。
+Event Correlator 是 Core 核心。
 
 负责建立：
 
@@ -1983,7 +1995,7 @@ Deep Inspection unavailable
 
 # 59. Logging
 
-Rust Agent 使用结构化日志。
+Rust Core 使用结构化日志。
 
 等级：
 
@@ -2121,7 +2133,7 @@ L2 / L4 可以后补。
 - Cloud Backend
 - Account System
 - Machine Learning
-- Remote Agent
+- Remote Core
 - Multi-host Dashboard
 
 ---

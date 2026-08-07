@@ -53,3 +53,25 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Rust
+target/
+
+# Build output
+build/
+cmake-build-*/
+
+# TraceLens local state
+tracelens.db
+*.db-shm
+*.db-wal
+*.log
+
+# Node / Vite / Tauri
+ui/node_modules/
+ui/dist/
+ui/*.tsbuildinfo
+ui/vite.config.js
+ui/vite.config.d.ts
+ui/src-tauri/target/
+ui/src-tauri/gen/

@@ -1,0 +1,11 @@
+[observation]
+default_level = 1
+deep_inspection_timeout = 300
+
+[runtime]
+preferred_userspace_runtime = "bpftime"
+
+[storage]
+database = "tracelens.db"
+plaintext_storage = "memory"
+plaintext_max_mb = 50
