@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde::Serialize;
-use tracelens_events::{ConnectionState, TransportProtocol};
+use tracelens_events::{ConnectionState, TcpState, TransportProtocol};
 
 use crate::observation::{ObservationLevel, ObservationTarget};
 use crate::Core;
@@ -46,10 +46,13 @@ struct ProcessResponse {
 struct ConnectionResponse {
     id: String,
     pid: Option<u32>,
+    process_name: Option<String>,
+    process_command_line: Option<String>,
     protocol: TransportProtocol,
     local: Option<tracelens_events::Endpoint>,
     remote: tracelens_events::Endpoint,
     state: ConnectionState,
+    tcp_state: Option<TcpState>,
     sent_bytes: u64,
     received_bytes: u64,
     domain: Option<String>,
@@ -185,10 +188,20 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                 .map(|record| ConnectionResponse {
                     id: record.connection.id.clone(),
                     pid: record.pid,
+                    process_name: record
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.executable.clone())
+                        .or_else(|| record.pid.and_then(read_process_name)),
+                    process_command_line: record
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.command_line.clone()),
                     protocol: record.connection.protocol,
                     local: record.connection.local.clone(),
                     remote: record.connection.remote.clone(),
                     state: record.connection.state,
+                    tcp_state: record.connection.tcp_state,
                     sent_bytes: record.connection.sent_bytes,
                     received_bytes: record.connection.received_bytes,
                     domain: record.connection.domain.clone(),
@@ -217,6 +230,12 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
             "application/json",
         ),
     }
+}
+
+fn read_process_name(pid: u32) -> Option<String> {
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn response_json<T, F>(build: F) -> Result<String, String>

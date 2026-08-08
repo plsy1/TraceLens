@@ -6,10 +6,11 @@
 
 - Phase 1：项目骨架、共享事件模型、eBPF/Cargo/CMake/UI 工具链已完成。
 - Phase 2 初版：已实现进程 exec/exit eBPF 事件、`/proc` 元数据补全、Rust 进程 Tracker 和只读 API。
-- Phase 3 初版：已实现 IPv4/IPv6 connect/close eBPF 事件、PID/FD 关联、Rust 连接 Tracker 和 UI 连接表。
-- Phase 2/3 待补：TCP 上传/下载字节计数、DNS 域名关联、完整连接状态和持久化。
+- Phase 3：已实现 IPv4/IPv6 connect/close、PID/FD 关联、上传/下载字节计数、TCP 状态事件、进程快照和 UI 连接表；closed 历史连接支持勾选显示。
+- Phase 4 初版：已实现 DNS query/response 事件、A/AAAA 解析、TTL 缓存和连接域名关联。
+- Phase 3/4 待补：更完整的 UDP/TCP DNS 覆盖、连接失败原因、持久化和域名冲突消歧。
 
-当前验收方式：启动 observer 后运行 `curl https://example.com`，在 dashboard 中查看真实进程和连接元数据。
+当前验收方式：启动 observer 后运行 `curl https://example.com`，在 dashboard 中查看真实进程、域名、TCP 状态和流量元数据。
 
 ## 1. 项目定位
 
@@ -2186,18 +2187,21 @@ L2 / L4 可以后补。
 - IPv4
 - IPv6
 - PID association
+- upload/download byte counters
+- TCP state events
+- process name/command-line snapshot on connection records
 - Connection UI
 
 待实现：
 
-- upload/download 字节计数
-- 更准确的 TCP 状态跟踪
+- 连接失败原因和更完整的入站连接覆盖
+- UDP/TCP DNS 边界情况
 
 ---
 
 ## Phase 4：DNS
 
-完成：
+当前已完成：
 
 - DNS query
 - response

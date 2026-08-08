@@ -26,9 +26,12 @@ type Endpoint = {
 type ConnectionRow = {
   id: string;
   pid: number | null;
+  process_name: string | null;
+  process_command_line: string | null;
   protocol: string;
   remote: Endpoint;
   state: string;
+  tcp_state: string | null;
   sent_bytes: number;
   received_bytes: number;
   domain: string | null;
@@ -59,8 +62,8 @@ const demoProcesses: ProcessRow[] = [
 ];
 
 const demoConnections: ConnectionRow[] = [
-  { id: "demo-curl", pid: 12345, protocol: "tcp", remote: { address: "93.184.216.34", port: 443 }, state: "established", sent_bytes: 8_000, received_bytes: 10_432, domain: "example.com" },
-  { id: "demo-python", pid: 9172, protocol: "tcp", remote: { address: "203.0.113.42", port: 443 }, state: "established", sent_bytes: 500_000_000, received_bytes: 0, domain: "suspicious.example" },
+  { id: "demo-curl", pid: 12345, process_name: "curl", process_command_line: "curl https://example.com", protocol: "tcp", remote: { address: "93.184.216.34", port: 443 }, state: "established", tcp_state: "established", sent_bytes: 8_000, received_bytes: 10_432, domain: "example.com" },
+  { id: "demo-python", pid: 9172, process_name: "python3", process_command_line: "python3 uploader.py", protocol: "tcp", remote: { address: "203.0.113.42", port: 443 }, state: "established", tcp_state: "established", sent_bytes: 500_000_000, received_bytes: 0, domain: "suspicious.example" },
 ];
 
 const initialSnapshot: Snapshot = {
@@ -87,12 +90,16 @@ function formatBytes(bytes: number): string {
 }
 
 function stateLabel(state: string): string {
-  return state.charAt(0).toUpperCase() + state.slice(1);
+  return state
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot);
   const [loading, setLoading] = useState(false);
+  const [showClosedConnections, setShowClosedConnections] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -119,6 +126,12 @@ function App() {
   const processNames = useMemo(
     () => new Map(snapshot.processes.map((process) => [process.pid, process.name])),
     [snapshot.processes],
+  );
+  const visibleConnections = useMemo(
+    () => showClosedConnections
+      ? snapshot.connections
+      : snapshot.connections.filter((connection) => connection.state !== "closed"),
+    [showClosedConnections, snapshot.connections],
   );
   const isLive = snapshot.mode === "live";
   const statusText = isLive ? "Core connected" : "Core offline · demo data";
@@ -223,7 +236,19 @@ function App() {
             <p className="eyebrow">{isLive ? "KERNEL EVENTS" : "DEMO EVENTS"}</p>
             <h2>Connections</h2>
           </div>
-          <span className="connection-count">{snapshot.connections.length} observed</span>
+          <div className="connection-controls">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={showClosedConnections}
+                onChange={(event) => setShowClosedConnections(event.target.checked)}
+              />
+              Show closed
+            </label>
+            <span className="connection-count">
+              {showClosedConnections ? `${snapshot.connections.length} observed` : `${visibleConnections.length} active`}
+            </span>
+          </div>
         </div>
         <div className="table-wrap">
           <table>
@@ -231,15 +256,17 @@ function App() {
               <tr><th>Process</th><th>PID</th><th>Remote</th><th>Domain</th><th>State</th><th>Traffic</th></tr>
             </thead>
             <tbody>
-              {snapshot.connections.length === 0 ? (
-                <tr><td colSpan={6} className="muted empty-cell">No connections observed yet.</td></tr>
-              ) : snapshot.connections.slice(0, 20).map((connection) => (
+              {visibleConnections.length === 0 ? (
+                <tr><td colSpan={6} className="muted empty-cell">
+                  {showClosedConnections ? "No connections observed yet." : "No active connections. Enable Show closed to inspect history."}
+                </td></tr>
+              ) : visibleConnections.slice(0, 20).map((connection) => (
                 <tr key={connection.id}>
-                  <td><span className="process-name">{connection.pid ? processNames.get(connection.pid) ?? "unknown" : "unknown"}</span></td>
+                  <td><span className="process-name">{connection.process_name ?? (connection.pid ? processNames.get(connection.pid) ?? `exited (${connection.pid})` : "unknown")}</span></td>
                   <td className="muted">{connection.pid ?? "—"}</td>
                   <td>{connection.remote.address}:{connection.remote.port}</td>
                   <td className="muted">{connection.domain ?? "—"}</td>
-                  <td><span className={`state state-${connection.state}`}>{stateLabel(connection.state)}</span></td>
+                  <td><span className={`state state-${connection.state}`}>{stateLabel(connection.tcp_state ?? connection.state)}</span></td>
                   <td>{formatBytes(connection.sent_bytes + connection.received_bytes)}</td>
                 </tr>
               ))}

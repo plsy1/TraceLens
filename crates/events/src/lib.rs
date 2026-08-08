@@ -19,6 +19,8 @@ pub enum EventKind {
     ProcessExit,
     TcpConnect,
     TcpClose,
+    TcpStateChanged,
+    TcpBytes,
     DnsQuery,
     DnsResponse,
     ObservationChanged,
@@ -37,6 +39,24 @@ pub enum ConnectionState {
     Connecting,
     Established,
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpState {
+    Established,
+    SynSent,
+    SynRecv,
+    FinWait1,
+    FinWait2,
+    TimeWait,
+    Close,
+    CloseWait,
+    LastAck,
+    Listen,
+    Closing,
+    NewSynRecv,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +81,7 @@ pub struct ConnectionRef {
     pub local: Option<Endpoint>,
     pub remote: Endpoint,
     pub state: ConnectionState,
+    pub tcp_state: Option<TcpState>,
     pub sent_bytes: u64,
     pub received_bytes: u64,
     pub domain: Option<String>,
@@ -80,6 +101,7 @@ pub enum EventPayload {
     Dns {
         domain: String,
         addresses: Vec<String>,
+        ttl_secs: u32,
     },
     Observation {
         target: String,
@@ -149,15 +171,51 @@ impl TraceEvent {
         connection: ConnectionRef,
         timestamp_ns: u64,
     ) -> Self {
+        Self::connection_event_with_process(source, kind, pid, None, connection, timestamp_ns)
+    }
+
+    pub fn connection_event_with_process(
+        source: EventSource,
+        kind: EventKind,
+        pid: u32,
+        process: Option<ProcessRef>,
+        connection: ConnectionRef,
+        timestamp_ns: u64,
+    ) -> Self {
         Self {
             id: format!("connection-{kind:?}-{}-{timestamp_ns}", connection.id),
             timestamp_ns,
             source,
             kind,
             pid: Some(pid),
-            process: None,
+            process,
             connection: Some(connection.clone()),
             payload: EventPayload::Connection { connection },
+        }
+    }
+
+    pub fn dns_event(
+        source: EventSource,
+        kind: EventKind,
+        pid: u32,
+        domain: &str,
+        addresses: Vec<String>,
+        ttl_secs: u32,
+        timestamp_ns: u64,
+    ) -> Self {
+        Self {
+            id: format!("dns-{kind:?}-{pid}-{domain}-{timestamp_ns}"),
+            timestamp_ns,
+            source,
+            kind,
+            pid: Some(pid),
+            process: None,
+            connection: None,
+            payload: EventPayload::Dns {
+                domain: domain.to_owned(),
+                addresses,
+                ttl_secs,
+            },
         }
     }
 }
