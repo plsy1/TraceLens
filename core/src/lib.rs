@@ -18,13 +18,14 @@ pub mod storage;
 pub mod tls;
 
 use config::CoreConfig;
+use dns::DnsTracker;
 use events::{EventBus, EventCorrelator};
 use network::ConnectionTracker;
 use observation::ObservationManager;
 use process::ProcessTracker;
 use runtime::RuntimeStatus;
 use storage::EventStore;
-use tracelens_events::{EventKind, TraceEvent};
+use tracelens_events::{EventKind, EventPayload, TraceEvent};
 
 /// Top-level composition root for the core service.
 pub struct Core {
@@ -35,6 +36,7 @@ pub struct Core {
     store: EventStore,
     processes: ProcessTracker,
     connections: ConnectionTracker,
+    dns: DnsTracker,
     observations: ObservationManager,
 }
 
@@ -48,6 +50,7 @@ impl Core {
             store: EventStore::new(),
             processes: ProcessTracker::default(),
             connections: ConnectionTracker::default(),
+            dns: DnsTracker::default(),
             observations: ObservationManager::default(),
         }
     }
@@ -80,11 +83,15 @@ impl Core {
         &self.connections
     }
 
+    pub fn dns(&self) -> &DnsTracker {
+        &self.dns
+    }
+
     pub fn observations(&self) -> &ObservationManager {
         &self.observations
     }
 
-    pub fn ingest_event(&mut self, event: TraceEvent) {
+    pub fn ingest_event(&mut self, mut event: TraceEvent) {
         match event.kind {
             EventKind::ProcessExec => {
                 if let Some(process) = event.process.clone() {
@@ -97,9 +104,65 @@ impl Core {
                 }
             }
             EventKind::TcpConnect | EventKind::TcpClose => {
-                if let Some(connection) = event.connection.clone() {
+                if let Some(mut connection) = event.connection.clone() {
+                    if connection.domain.is_none() {
+                        connection.domain = self
+                            .dns
+                            .domain_for_address(&connection.remote.address, event.timestamp_ns);
+                    }
+                    let process = event.process.clone().or_else(|| {
+                        event
+                            .pid
+                            .and_then(|pid| self.processes.get(pid))
+                            .map(|record| record.identity.clone())
+                    });
+                    event.connection = Some(connection.clone());
+                    event.payload = EventPayload::Connection {
+                        connection: connection.clone(),
+                    };
                     self.connections
-                        .observe(event.pid, connection, event.timestamp_ns);
+                        .observe(event.pid, process, connection, event.timestamp_ns);
+                }
+            }
+            EventKind::TcpStateChanged | EventKind::TcpBytes => {
+                if let Some(mut connection) = event.connection.clone() {
+                    if connection.domain.is_none() {
+                        connection.domain = self
+                            .dns
+                            .domain_for_address(&connection.remote.address, event.timestamp_ns);
+                    }
+                    let process = event.process.clone().or_else(|| {
+                        event
+                            .pid
+                            .and_then(|pid| self.processes.get(pid))
+                            .map(|record| record.identity.clone())
+                    });
+                    event.connection = Some(connection.clone());
+                    event.payload = EventPayload::Connection {
+                        connection: connection.clone(),
+                    };
+                    self.connections
+                        .observe(event.pid, process, connection, event.timestamp_ns);
+                }
+            }
+            EventKind::DnsResponse => {
+                if let EventPayload::Dns {
+                    domain,
+                    addresses,
+                    ttl_secs,
+                } = &event.payload
+                {
+                    if !addresses.is_empty() {
+                        self.dns.observe_response(
+                            domain.clone(),
+                            addresses.clone(),
+                            *ttl_secs,
+                            event.timestamp_ns,
+                        );
+                        if let Some(pid) = event.pid {
+                            self.connections.set_domain(pid, addresses, domain);
+                        }
+                    }
                 }
             }
             _ => {}

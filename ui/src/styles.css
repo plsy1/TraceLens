@@ -61,6 +61,9 @@ td { color: #cbd6dc; font-size: 13px; }
 .empty-note p { margin: 1px 0 0; font-size: 12px; line-height: 1.5; }
 .connection-panel { margin-top: 24px; }
 .connection-count { color: #8495a4; font-size: 12px; }
+.connection-controls { align-items: center; display: flex; gap: 1rem; }
+.checkbox-label { align-items: center; color: #8495a4; display: flex; font-size: 11px; gap: 6px; }
+.checkbox-label input { accent-color: #6ee7d8; }
 .state { display: inline-block; padding: 4px 7px; border-radius: 5px; font-size: 10px; font-weight: 700; }
 .state-established { color: #6ee7d8; background: rgba(110, 231, 216, .1); }
 .state-connecting { color: #f5d68a; background: rgba(245, 214, 138, .12); }
