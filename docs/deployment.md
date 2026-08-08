@@ -21,9 +21,15 @@ cmake -S . -B build -DTRACELENS_BUILD_BPF=ON
 cmake --build build
 ```
 
-The core will eventually require the appropriate Linux capabilities to load
-eBPF programs. Capability checks belong in the runtime adapter, not in the
-event model.
+The Phase 2/3 observer requires root or equivalent Linux BPF capabilities:
+
+~~~bash
+cargo build -p tracelens-core
+sudo ./target/debug/tracelens-core --observe --api-listen 127.0.0.1:8080
+~~~
+
+This loads build/bpf/objects/process.o and network.o, attaches process
+exec/exit and connect/close tracepoints, and serves the read-only API.
 
 ## Desktop UI
 

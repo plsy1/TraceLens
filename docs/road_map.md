@@ -2,6 +2,15 @@
 
 # TraceLens 项目完整规划
 
+## 当前实现进度
+
+- Phase 1：项目骨架、共享事件模型、eBPF/Cargo/CMake/UI 工具链已完成。
+- Phase 2 初版：已实现进程 exec/exit eBPF 事件、`/proc` 元数据补全、Rust 进程 Tracker 和只读 API。
+- Phase 3 初版：已实现 IPv4/IPv6 connect/close eBPF 事件、PID/FD 关联、Rust 连接 Tracker 和 UI 连接表。
+- Phase 2/3 待补：TCP 上传/下载字节计数、DNS 域名关联、完整连接状态和持久化。
+
+当前验收方式：启动 observer 后运行 `curl https://example.com`，在 dashboard 中查看真实进程和连接元数据。
+
 ## 1. 项目定位
 
 项目名称：
@@ -2155,26 +2164,34 @@ L2 / L4 可以后补。
 
 ## Phase 2：Process Tracking
 
-完成：
+当前已完成：
 
 - exec
 - exit
-- Process Tree
+- 基础进程读模型
 - Process UI
+
+待实现：
+
+- Process Tree
 
 ---
 
 ## Phase 3：Connection Tracking
 
-完成：
+当前已完成：
 
 - TCP connect
 - close
 - IPv4
 - IPv6
 - PID association
-- upload/download
 - Connection UI
+
+待实现：
+
+- upload/download 字节计数
+- 更准确的 TCP 状态跟踪
 
 ---
 

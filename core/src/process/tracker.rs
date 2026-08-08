@@ -21,11 +21,23 @@ impl ProcessTracker {
             });
     }
 
+    pub fn remove(&mut self, pid: u32) -> Option<ProcessRecord> {
+        self.processes.remove(&pid)
+    }
+
     pub fn get(&self, pid: u32) -> Option<&ProcessRecord> {
         self.processes.get(&pid)
     }
 
     pub fn all(&self) -> impl Iterator<Item = &ProcessRecord> {
         self.processes.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.processes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.processes.is_empty()
     }
 }

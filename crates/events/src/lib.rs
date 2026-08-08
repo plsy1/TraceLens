@@ -101,15 +101,35 @@ pub struct TraceEvent {
 
 impl TraceEvent {
     pub fn process_exec(pid: u32, executable: &str, command_line: &str, timestamp_ns: u64) -> Self {
-        Self {
-            id: format!("process-exec-{pid}-{timestamp_ns}"),
+        Self::process_event(
+            EventSource::Core,
+            EventKind::ProcessExec,
+            pid,
+            None,
+            executable,
+            command_line,
             timestamp_ns,
-            source: EventSource::Core,
-            kind: EventKind::ProcessExec,
+        )
+    }
+
+    pub fn process_event(
+        source: EventSource,
+        kind: EventKind,
+        pid: u32,
+        ppid: Option<u32>,
+        executable: &str,
+        command_line: &str,
+        timestamp_ns: u64,
+    ) -> Self {
+        Self {
+            id: format!("process-{kind:?}-{pid}-{timestamp_ns}"),
+            timestamp_ns,
+            source,
+            kind,
             pid: Some(pid),
             process: Some(ProcessRef {
                 pid,
-                ppid: None,
+                ppid,
                 executable: Some(executable.to_owned()),
                 command_line: Some(command_line.to_owned()),
                 start_time_ns: Some(timestamp_ns),
@@ -119,6 +139,25 @@ impl TraceEvent {
                 executable: executable.to_owned(),
                 command_line: command_line.to_owned(),
             },
+        }
+    }
+
+    pub fn connection_event(
+        source: EventSource,
+        kind: EventKind,
+        pid: u32,
+        connection: ConnectionRef,
+        timestamp_ns: u64,
+    ) -> Self {
+        Self {
+            id: format!("connection-{kind:?}-{}-{timestamp_ns}", connection.id),
+            timestamp_ns,
+            source,
+            kind,
+            pid: Some(pid),
+            process: None,
+            connection: Some(connection.clone()),
+            payload: EventPayload::Connection { connection },
         }
     }
 }

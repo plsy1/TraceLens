@@ -1,7 +1,8 @@
 # TraceLens eBPF layer
 
-This directory contains the probe-side boundary. The current programs are
-minimal compile targets and do not emit events yet.
+This directory contains the probe-side boundary. The process and network
+probes now emit Phase 2/3 metadata events; DNS, TCP byte counters, and
+userspace probes remain compile targets for later phases.
 
 ```text
 kernel/       always-on process, network, DNS, TCP, and file probes
@@ -33,5 +34,6 @@ cmake -S . -B build -DTRACELENS_BUILD_BPF=ON
 cmake --build build
 ```
 
-`vmlinux.h` generation and ring-buffer emission will be added alongside the
-first real process and TCP probes.
+process.bpf.c emits exec/exit records and network.bpf.c emits connect/close
+records through ring buffers. The Rust loader reads the resulting process.o
+and network.o objects from build/bpf/objects.

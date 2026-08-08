@@ -6,7 +6,8 @@ escalate selected processes or connections into deeper userspace inspection.
 
 ## Repository status
 
-The repository now contains the Phase 1 application skeleton:
+The repository now contains the Phase 1 application skeleton and the first
+Phase 2/3 process/connection event path:
 
 ```text
 core/           Rust composition root and runtime boundaries
@@ -17,9 +18,10 @@ config/         example configuration
 docs/           product and engineering documentation
 ```
 
-The probes and local API are intentionally placeholders. The current core
-can initialize its runtime model and print a sample shared event, but it does
-not attach to the kernel yet.
+The process and connect/close probes now emit metadata through BPF ring buffers;
+the Core loader decodes them into process and connection read models and serves
+a small read-only local API. DNS, byte counters, userspace TLS probes, and
+detection rules are still placeholders.
 
 ## Prerequisites
 
@@ -51,6 +53,18 @@ cmake -S . -B build -DTRACELENS_BUILD_BPF=ON
 cmake --build build
 ```
 
+Run the real Phase 2/3 observer (root or equivalent BPF capabilities are
+required):
+
+```bash
+cargo build -p tracelens-core
+sudo ./target/debug/tracelens-core --observe --api-listen 127.0.0.1:8080
+```
+
+The API exposes /api/health, /api/summary, /api/processes, and
+/api/connections. Start the UI separately with npm run dev; it polls the Core
+API and falls back to clearly labelled demo data when Core is offline.
+
 Run the frontend:
 
 ```bash
@@ -61,9 +75,7 @@ npm run dev
 
 ## Next implementation slice
 
-The next vertical slice should connect `bpf/kernel/process.bpf.c` and
-`bpf/kernel/network.bpf.c` to a ring buffer, decode them into
-`tracelens-events`, and
-feed the process/connection read models. The first end-to-end acceptance case
-is `curl https://example.com` appearing as a process, connection, and domain
-in the dashboard.
+The next vertical slice is DNS correlation: connect the observed process and
+connection to DNS query/response events so the dashboard can show a domain
+instead of only an IP. Byte counters and richer connection state tracking will
+follow that metadata path.
