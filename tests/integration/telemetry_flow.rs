@@ -885,6 +885,27 @@ fn capture_scope_limits_kernel_events_to_a_pid_or_process_name() {
 }
 
 #[test]
+fn switching_capture_scope_drops_the_previous_exact_level() {
+    let mut core = Core::new(CoreConfig::default());
+    core.stop_capture();
+    let previous_target = ObservationTarget::ProcessName("curl".to_owned());
+
+    core.set_persistent_observation(previous_target.clone(), ObservationLevel::L5);
+    assert_eq!(
+        core.observations().current_level(&previous_target),
+        ObservationLevel::L5
+    );
+
+    core.set_capture_scope(CaptureScope::ProcessName("curl".to_owned()));
+    core.set_capture_scope(CaptureScope::Global);
+
+    assert_eq!(
+        core.observations().current_level(&previous_target),
+        ObservationLevel::L1
+    );
+}
+
+#[test]
 fn serves_capture_start_and_reset_commands_through_the_api() {
     let core = Arc::new(Mutex::new(Core::new(CoreConfig::default())));
     core.lock().expect("core lock").stop_capture();

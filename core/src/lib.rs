@@ -1074,6 +1074,21 @@ impl Core {
     }
 
     pub fn set_capture_scope(&mut self, scope: CaptureScope) {
+        if self.capture_scope != scope {
+            // A capture target is the unit selected in the capture console.
+            // Do not let the exact level from the previous PID/process-name
+            // capture silently carry into the next one (especially when the
+            // next target is Global).
+            match &self.capture_scope {
+                CaptureScope::Process(pid) => self
+                    .observations
+                    .downgrade(&observation::ObservationTarget::Process(*pid)),
+                CaptureScope::ProcessName(name) => self
+                    .observations
+                    .downgrade(&observation::ObservationTarget::ProcessName(name.clone())),
+                CaptureScope::Global => {}
+            }
+        }
         self.capture_scope = scope;
         if self.is_capturing() {
             self.probe_runtime.detach_all();

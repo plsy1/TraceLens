@@ -947,10 +947,13 @@ function App() {
       let captureTarget = "global";
       let numericLevel: number | undefined;
       if (action === "start") {
-        // With existing events, the top-bar button resumes the current
-        // session. Reuse Core's target instead of requiring the hidden
-        // capture form to be filled again.
-        const existingTarget = snapshot.mode === "live" && snapshot.summary.event_count > 0
+        // The top-bar button can resume the active workspace session, but the
+        // capture console must always honor the target and level the user just
+        // selected. Previously any stopped session with existing events was
+        // treated as a resume, so the console silently ignored its level.
+        const existingTarget = snapshot.mode === "live"
+          && captureWorkspaceActive
+          && snapshot.summary.event_count > 0
           ? parseCaptureTarget(snapshot.summary.capture_target)
           : null;
         const selection = existingTarget ?? {
@@ -1005,7 +1008,7 @@ function App() {
     } finally {
       setCaptureBusy(false);
     }
-  }, [captureLevel, captureNameInput, capturePidInput, captureTargetMode, postCommand, refresh, snapshot.mode, snapshot.summary.capture_target, snapshot.summary.event_count]);
+  }, [captureLevel, captureNameInput, capturePidInput, captureTargetMode, captureWorkspaceActive, postCommand, refresh, snapshot.mode, snapshot.summary.capture_target, snapshot.summary.event_count]);
 
   const setObservationLevel = useCallback(async (pid: number, level: string) => {
     setObservationBusyPid(pid);
@@ -1038,11 +1041,15 @@ function App() {
 
   useEffect(() => {
     if (snapshot.mode !== "live") return;
+    // When the Core is stopped, this is the new-capture form. Do not mirror
+    // the previous session back into it on every one-second refresh while the
+    // user is editing a new target.
+    if (snapshot.summary.capture_state === "stopped" && !captureWorkspaceActive) return;
     const selection = parseCaptureTarget(snapshot.summary.capture_target);
     setCaptureTargetMode(selection.mode);
     if (selection.mode === "pid" && selection.pid) setCapturePidInput(selection.pid);
     if (selection.mode === "name" && selection.name) setCaptureNameInput(selection.name);
-  }, [snapshot.mode, snapshot.summary.capture_target]);
+  }, [captureWorkspaceActive, snapshot.mode, snapshot.summary.capture_state, snapshot.summary.capture_target]);
 
   useEffect(() => {
     if (!autoRefresh) return undefined;
