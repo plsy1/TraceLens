@@ -35,6 +35,7 @@ cmake --build build
 ```
 
 process.bpf.c emits exec/exit records, network.bpf.c emits connect/close/state/
-byte records, and dns.bpf.c emits bounded DNS query/response payloads through
-ring buffers. The Rust loader reads the resulting process.o, network.o, and
-dns.o objects from build/bpf/objects.
+byte records, and dns.bpf.c emits bounded UDP/TCP DNS query/response payloads
+through ring buffers. DNS socket tracking covers sendto/recvfrom,
+sendmsg/recvmsg, connected read/write, and close cleanup. The Rust loader reads
+the resulting process.o, network.o, and dns.o objects from build/bpf/objects.

@@ -194,6 +194,7 @@ dependencies = [
 name = "tracelens-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tracelens-core",
  "tracelens-events",
 ]

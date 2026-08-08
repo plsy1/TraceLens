@@ -81,6 +81,13 @@ pub fn serve(core: Arc<Mutex<Core>>, listen: SocketAddr) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Serve one request on a pre-bound listener. This keeps API contract tests
+/// deterministic without starting an unbounded server thread.
+pub fn serve_once(listener: TcpListener, core: Arc<Mutex<Core>>) -> std::io::Result<()> {
+    let (stream, _) = listener.accept()?;
+    handle_connection(stream, &core)
+}
+
 fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io::Result<()> {
     let mut buffer = [0_u8; 8192];
     let bytes_read = stream.read(&mut buffer)?;
@@ -91,7 +98,8 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
         .unwrap_or_default()
         .split_whitespace();
     let method = request_line.next().unwrap_or_default();
-    let path = request_line.next().unwrap_or_default();
+    let raw_path = request_line.next().unwrap_or_default();
+    let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
 
     if method == "OPTIONS" {
         return write_response(&mut stream, 204, "", "text/plain");
@@ -211,6 +219,10 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                 .collect::<Vec<_>>();
             Ok(connections)
         }),
+        "/api/timeline" => response_json(|| {
+            let core = core.lock().map_err(|_| "core lock poisoned")?;
+            Ok(core.timeline(timeline_limit(query)))
+        }),
         _ => {
             return write_response(
                 &mut stream,
@@ -230,6 +242,19 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
             "application/json",
         ),
     }
+}
+
+fn timeline_limit(query: &str) -> usize {
+    query
+        .split('&')
+        .find_map(|parameter| {
+            let (name, value) = parameter.split_once('=')?;
+            (name == "limit")
+                .then(|| value.parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(50)
+        .clamp(1, 200)
 }
 
 fn read_process_name(pid: u32) -> Option<String> {

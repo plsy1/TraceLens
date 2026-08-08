@@ -19,7 +19,7 @@ pub mod tls;
 
 use config::CoreConfig;
 use dns::DnsTracker;
-use events::{EventBus, EventCorrelator};
+use events::{EventBus, EventCorrelator, TimelineEntry};
 use network::ConnectionTracker;
 use observation::ObservationManager;
 use process::ProcessTracker;
@@ -91,7 +91,25 @@ impl Core {
         &self.observations
     }
 
+    pub fn timeline(&self, limit: usize) -> Vec<TimelineEntry> {
+        let mut events = self.store.snapshot();
+        events.sort_by_key(|event| event.timestamp_ns);
+        let start = events.len().saturating_sub(limit.min(200));
+        events
+            .into_iter()
+            .skip(start)
+            .map(TimelineEntry::from_event)
+            .collect()
+    }
+
     pub fn ingest_event(&mut self, mut event: TraceEvent) {
+        if event.process.is_none() {
+            event.process = event
+                .pid
+                .and_then(|pid| self.processes.get(pid))
+                .map(|record| record.identity.clone());
+        }
+
         match event.kind {
             EventKind::ProcessExec => {
                 if let Some(process) = event.process.clone() {
@@ -106,9 +124,11 @@ impl Core {
             EventKind::TcpConnect | EventKind::TcpClose => {
                 if let Some(mut connection) = event.connection.clone() {
                     if connection.domain.is_none() {
-                        connection.domain = self
-                            .dns
-                            .domain_for_address(&connection.remote.address, event.timestamp_ns);
+                        connection.domain = self.resolve_domain(
+                            event.pid,
+                            &connection.remote.address,
+                            event.timestamp_ns,
+                        );
                     }
                     let process = event.process.clone().or_else(|| {
                         event
@@ -127,9 +147,11 @@ impl Core {
             EventKind::TcpStateChanged | EventKind::TcpBytes => {
                 if let Some(mut connection) = event.connection.clone() {
                     if connection.domain.is_none() {
-                        connection.domain = self
-                            .dns
-                            .domain_for_address(&connection.remote.address, event.timestamp_ns);
+                        connection.domain = self.resolve_domain(
+                            event.pid,
+                            &connection.remote.address,
+                            event.timestamp_ns,
+                        );
                     }
                     let process = event.process.clone().or_else(|| {
                         event
@@ -147,21 +169,33 @@ impl Core {
             }
             EventKind::DnsResponse => {
                 if let EventPayload::Dns {
+                    protocol: _,
                     domain,
                     addresses,
                     ttl_secs,
                 } = &event.payload
                 {
-                    if !addresses.is_empty() {
+                    if let Some(pid) = event.pid {
+                        self.dns.observe_response_for_process(
+                            pid,
+                            domain.clone(),
+                            addresses.clone(),
+                            *ttl_secs,
+                            event.timestamp_ns,
+                        );
+                    } else {
                         self.dns.observe_response(
                             domain.clone(),
                             addresses.clone(),
                             *ttl_secs,
                             event.timestamp_ns,
                         );
+                    }
+                    if !addresses.is_empty() {
                         if let Some(pid) = event.pid {
                             self.connections.set_domain(pid, addresses, domain);
                         }
+                        self.connections.set_domain_for_addresses(addresses, domain);
                     }
                 }
             }
@@ -171,6 +205,15 @@ impl Core {
         let event = self.correlator.correlate(event);
         self.store.insert(event.clone());
         self.event_bus.publish(event);
+    }
+
+    fn resolve_domain(&self, pid: Option<u32>, address: &str, timestamp_ns: u64) -> Option<String> {
+        pid.and_then(|pid| {
+            self.dns
+                .domain_for_process_address(pid, address, timestamp_ns)
+        })
+        .or_else(|| self.dns.domain_for_unscoped_address(address, timestamp_ns))
+        .or_else(|| self.dns.domain_for_address(address, timestamp_ns))
     }
 
     /// Stable smoke-test event for wiring the UI and local API.

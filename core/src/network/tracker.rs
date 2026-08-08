@@ -91,6 +91,18 @@ impl ConnectionTracker {
         }
     }
 
+    pub fn set_domain_for_addresses(&mut self, addresses: &[String], domain: &str) {
+        for record in self.connections.values_mut() {
+            if record.connection.domain.is_none()
+                && addresses
+                    .iter()
+                    .any(|address| address == &record.connection.remote.address)
+            {
+                record.connection.domain = Some(domain.to_owned());
+            }
+        }
+    }
+
     pub fn get(&self, id: &str) -> Option<&ConnectionRecord> {
         self.connections.get(id)
     }

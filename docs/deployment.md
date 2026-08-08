@@ -29,7 +29,8 @@ sudo ./target/debug/tracelens-core --observe --api-listen 127.0.0.1:8080
 ~~~
 
 This loads build/bpf/objects/process.o, network.o, and dns.o, attaches process,
-TCP state/byte, and DNS tracepoints, and serves the read-only API.
+TCP state/byte, and DNS tracepoints, and serves the read-only API including
+`/api/timeline?limit=50`.
 
 ## Desktop UI
 
