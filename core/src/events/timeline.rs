@@ -4,6 +4,36 @@ use tracelens_events::{
     TransportProtocol,
 };
 
+#[derive(Debug, Clone)]
+pub struct TimelineFilter {
+    pub pid: Option<u32>,
+    pub kind: Option<EventKind>,
+    /// Number of newest matching events to skip. This makes the next page
+    /// point toward older history rather than newer events.
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for TimelineFilter {
+    fn default() -> Self {
+        Self {
+            pid: None,
+            kind: None,
+            offset: 0,
+            limit: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TimelinePage {
+    pub entries: Vec<TimelineEntry>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TimelineEntry {
     pub id: String,

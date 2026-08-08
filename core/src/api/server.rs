@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde::Serialize;
-use tracelens_events::{ConnectionState, TcpState, TransportProtocol};
+use tracelens_events::{ConnectionState, EventKind, TcpState, TransportProtocol};
 
+use crate::events::TimelineFilter;
 use crate::observation::{ObservationLevel, ObservationTarget};
 use crate::Core;
 
@@ -221,7 +222,7 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
         }),
         "/api/timeline" => response_json(|| {
             let core = core.lock().map_err(|_| "core lock poisoned")?;
-            Ok(core.timeline(timeline_limit(query)))
+            Ok(core.timeline_page(timeline_filter(query)))
         }),
         _ => {
             return write_response(
@@ -244,17 +245,40 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
     }
 }
 
-fn timeline_limit(query: &str) -> usize {
-    query
-        .split('&')
-        .find_map(|parameter| {
-            let (name, value) = parameter.split_once('=')?;
-            (name == "limit")
-                .then(|| value.parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(50)
-        .clamp(1, 200)
+fn timeline_filter(query: &str) -> TimelineFilter {
+    TimelineFilter {
+        pid: query_parameter(query, "pid").and_then(|value| value.parse().ok()),
+        kind: query_parameter(query, "kind").and_then(parse_event_kind),
+        offset: query_parameter(query, "offset")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        limit: query_parameter(query, "limit")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(50)
+            .clamp(1, 200),
+    }
+}
+
+fn query_parameter<'query>(query: &'query str, name: &str) -> Option<&'query str> {
+    query.split('&').find_map(|parameter| {
+        let (parameter_name, value) = parameter.split_once('=')?;
+        (parameter_name == name).then_some(value)
+    })
+}
+
+fn parse_event_kind(value: &str) -> Option<EventKind> {
+    Some(match value {
+        "process_exec" => EventKind::ProcessExec,
+        "process_exit" => EventKind::ProcessExit,
+        "tcp_connect" => EventKind::TcpConnect,
+        "tcp_close" => EventKind::TcpClose,
+        "tcp_state_changed" => EventKind::TcpStateChanged,
+        "tcp_bytes" => EventKind::TcpBytes,
+        "dns_query" => EventKind::DnsQuery,
+        "dns_response" => EventKind::DnsResponse,
+        "observation_changed" => EventKind::ObservationChanged,
+        _ => return None,
+    })
 }
 
 fn read_process_name(pid: u32) -> Option<String> {

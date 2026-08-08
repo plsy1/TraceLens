@@ -62,9 +62,9 @@ sudo ./target/debug/tracelens-core --observe --api-listen 127.0.0.1:8080
 ```
 
 The API exposes /api/health, /api/summary, /api/processes, /api/connections,
-and /api/timeline?limit=50. Start the UI separately with npm run dev; it polls
-the Core API, hides closed connections by default, and falls back to clearly
-labelled demo data when Core is offline.
+and `/api/timeline?limit=50&offset=0&pid=&kind=`. Start the UI separately with
+npm run dev; it polls the Core API, hides closed connections by default, and
+falls back to clearly labelled demo data when Core is offline.
 
 Run the frontend:
 

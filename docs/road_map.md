@@ -2228,10 +2228,11 @@ python
 
 - Core 按 timestamp 聚合 Process、Network、DNS 事件
 - TimelineEntry 统一读模型
-- `/api/timeline?limit=50` 只读接口
-- UI Timeline 展示最近事件
+- `/api/timeline?limit=50&offset=0&pid=&kind=` 只读接口
+- PID/事件类型过滤和向更早事件翻页
+- UI Timeline 筛选器、事件总数和 Load older 交互
 
-后续补充：持久化历史查询、按 PID/连接过滤和分页。
+后续补充：持久化历史查询和按连接 ID 过滤。
 
 ---
 

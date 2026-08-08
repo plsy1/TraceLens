@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use tracelens_core::{api::server, config::CoreConfig, Core};
+use tracelens_core::{api::server, config::CoreConfig, events::TimelineFilter, Core};
 use tracelens_events::{
     ConnectionRef, ConnectionState, Endpoint, EventKind, EventSource, TcpState, TraceEvent,
     TransportProtocol,
@@ -168,6 +168,39 @@ fn correlates_process_dns_and_connection_telemetry() {
     assert_eq!(timeline[1].domain.as_deref(), Some("example.net"));
     assert_eq!(timeline[2].kind, EventKind::TcpConnect);
     assert_eq!(timeline[4].kind, EventKind::TcpBytes);
+
+    let dns_page = core.timeline_page(TimelineFilter {
+        kind: Some(EventKind::DnsResponse),
+        limit: 1,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(dns_page.total, 1);
+    assert_eq!(dns_page.entries[0].kind, EventKind::DnsResponse);
+
+    let latest_page = core.timeline_page(TimelineFilter {
+        limit: 2,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(latest_page.entries.len(), 2);
+    assert!(latest_page.has_more);
+    assert_eq!(latest_page.entries[1].kind, EventKind::TcpBytes);
+
+    let older_page = core.timeline_page(TimelineFilter {
+        limit: 2,
+        offset: 2,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(older_page.entries[0].kind, EventKind::DnsResponse);
+    assert_eq!(older_page.entries[1].kind, EventKind::TcpConnect);
+    assert!(older_page.has_more);
+
+    let oldest_page = core.timeline_page(TimelineFilter {
+        limit: 2,
+        offset: 4,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(oldest_page.entries[0].kind, EventKind::ProcessExec);
+    assert!(!oldest_page.has_more);
 }
 
 #[test]
@@ -279,7 +312,7 @@ fn serves_timeline_through_the_read_only_api() {
     let mut client = TcpStream::connect(address).expect("connect test API listener");
     client
         .write_all(
-            b"GET /api/timeline?limit=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            b"GET /api/timeline?limit=1&pid=4242&kind=process_exec HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .expect("write API request");
     let mut response = String::new();
@@ -295,8 +328,11 @@ fn serves_timeline_through_the_read_only_api() {
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .expect("HTTP response body");
-    let entries: Vec<serde_json::Value> = serde_json::from_str(body).expect("timeline JSON");
+    let page: serde_json::Value = serde_json::from_str(body).expect("timeline JSON");
+    let entries = page["entries"].as_array().expect("timeline entries");
     assert_eq!(entries.len(), 1);
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["has_more"], false);
     assert_eq!(entries[0]["kind"], "process_exec");
     assert_eq!(entries[0]["process_name"], "curl");
 }

@@ -19,7 +19,7 @@ pub mod tls;
 
 use config::CoreConfig;
 use dns::DnsTracker;
-use events::{EventBus, EventCorrelator, TimelineEntry};
+use events::{EventBus, EventCorrelator, TimelineEntry, TimelineFilter, TimelinePage};
 use network::ConnectionTracker;
 use observation::ObservationManager;
 use process::ProcessTracker;
@@ -92,14 +92,40 @@ impl Core {
     }
 
     pub fn timeline(&self, limit: usize) -> Vec<TimelineEntry> {
+        self.timeline_page(TimelineFilter {
+            limit,
+            ..TimelineFilter::default()
+        })
+        .entries
+    }
+
+    pub fn timeline_page(&self, filter: TimelineFilter) -> TimelinePage {
         let mut events = self.store.snapshot();
         events.sort_by_key(|event| event.timestamp_ns);
-        let start = events.len().saturating_sub(limit.min(200));
-        events
+        events.retain(|event| {
+            filter.pid.is_none_or(|pid| event.pid == Some(pid))
+                && filter.kind.is_none_or(|kind| event.kind == kind)
+        });
+
+        let total = events.len();
+        let limit = filter.limit.clamp(1, 200);
+        let offset = filter.offset.min(total);
+        let end = total.saturating_sub(offset);
+        let start = end.saturating_sub(limit);
+        let entries = events
             .into_iter()
             .skip(start)
+            .take(end.saturating_sub(start))
             .map(TimelineEntry::from_event)
-            .collect()
+            .collect();
+
+        TimelinePage {
+            entries,
+            total,
+            offset,
+            limit,
+            has_more: start > 0,
+        }
     }
 
     pub fn ingest_event(&mut self, mut event: TraceEvent) {
