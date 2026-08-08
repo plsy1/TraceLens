@@ -7,7 +7,7 @@ runtime. OpenSSL/TLS objects emit Phase 8 metadata records through their own
 ring buffers. The Phase 10 HTTP object is attached at L4 and uses a separate
 bounded `SSL_read`/`SSL_write` capture ABI; Core parses the bytes and drops the
 raw capture. The Phase 9 plaintext object is only attached at L5: it pairs the
-same entry/return probes and caps each persisted plaintext record at 512 bytes.
+same entry/return probes and caps each persisted plaintext record at 16 KiB.
 
 ```text
 kernel/       always-on process, network, DNS, TCP, and file probes

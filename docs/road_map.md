@@ -12,11 +12,12 @@
 - Phase 6 初版：已实现目标级观测会话、L1-L5 升级/降级、超时回收、观测命令 API 和进程观测等级控件。
 - Phase 7：已实现 bpftime CLI/loader 适配、目标 ELF/libssl 解析、真实 libbpf kernel uProbe fallback、attach/detach 生命周期和失败状态 API；本机尚未安装 bpftime，因此官方 runtime 路径仍需在具备 bpftime 的环境做 privileged E2E 验证。
 - Phase 8：已实现 OpenSSL TLS 元数据采集、SNI/version/SSL object/fd 缓存、连接关联和 Timeline/UI 展示。
-- Phase 9：已实现 L5 按需 `SSL_read`/`SSL_write` 明文片段采集、SSL object 关联、512 B 单事件上限、Timeline/UI 展示和测试覆盖。
+- Phase 9：已实现 L5 按需 `SSL_read`/`SSL_write` 明文片段采集、SSL object 关联、16 KiB 单事件上限、Timeline/UI 展示和测试覆盖。
 - Phase 10：已实现独立 L4 HTTP capture、双向流重组、HTTP/1.1 请求/响应解析、Content-Length/chunked framing、HTTP 元数据事件、Timeline/API/UI 展示和测试覆盖。
+- Capture workflow：observer 默认待机；已实现 Selected PID、进程名、Global 三种捕获范围、L1-L5 选择、显式 Start/Pause/Reset、进程候选列表和按范围过滤事件。Reset 清空本次内存捕获并立即开始新会话。
 - 后续待补：TLS 连接失败原因、更完整的入站连接覆盖、域名事务级消歧、HTTP 事件和 privileged eBPF/bpftime E2E 测试。
 
-当前验收方式：启动 observer 后运行 `curl https://example.com`，在 dashboard 中查看真实进程、域名、TCP 状态和流量元数据。
+当前验收方式：启动 observer 后，在 Web UI 选择 PID、进程名或 Global，设置等级并点击 Start；生成流量后在本次 capture session 中查看真实进程、域名、TCP 状态和流量元数据。
 
 ## 1. 项目定位
 
@@ -2258,6 +2259,10 @@ python
 - `GET /api/observations`
 - `POST /api/observations`
 - `DELETE /api/observations?target=...`
+- `GET /api/process-candidates`
+- `GET /api/capture`
+- `POST /api/capture/start|stop|reset`
+- `GET/POST /api/observations/default`
 - Processes UI 观测等级控件
 
 仍需补充：
@@ -2314,7 +2319,7 @@ L3
 - SSL_read
 - SSL_write
 - 入口/返回点配对，保证 `SSL_read` 在返回后读取实际 buffer
-- 有界 buffer collection：单条事件最多 512 B，保留原始字节数和截断标记
+- 有界 buffer collection：单条事件最多 16 KiB，保留原始字节数和截断标记
 - SSL object → TLS session → socket/connection correlation
 - Timeline、连接详情和事件类型筛选中的 plaintext UI
 - 默认只在 L5 目标上挂载，L1-L3 不采集 payload
@@ -2375,7 +2380,7 @@ File
 
 关系图。
 
-Core 提供 `/api/graph` 派生接口，WebUI 以固定高度 SVG 展示 Process、Connection、Domain、File 节点和关系边。图数据从内存 read model 重建，不额外引入持久化数据库；点击节点可以回到对应的时间线或连接详情。
+Core 仍保留 `/api/graph` 派生接口供后续行为分析使用；当前 WebUI 不把它放进主捕获流程，避免用无法直接指导抓取的关系图干扰工具操作。
 
 ---
 

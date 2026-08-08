@@ -29,7 +29,7 @@ independently.
 - `storage`: bounded in-memory timeline store by default, with optional SQLite history mode.
 - `runtime`: bpftime CLI/loader integration, target ELF/libssl resolution,
   real userspace probe lifecycle, and libbpf kernel uProbe fallback.
-- `api`: read API plus connection-session and observation-level command endpoints for the UI.
+- `api`: capture lifecycle, process-candidate, read, connection-session, and observation-level command endpoints for the UI.
 
 The kernel event path and Phase 8 OpenSSL metadata path are real: the latter
 consumes a per-object userspace ring buffer and correlates SNI/version/fd data

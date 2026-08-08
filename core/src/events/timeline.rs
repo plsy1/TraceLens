@@ -9,6 +9,9 @@ pub struct TimelineFilter {
     pub pid: Option<u32>,
     pub kind: Option<EventKind>,
     pub connection_id: Option<String>,
+    /// Include individual SSL plaintext fragments in addition to aggregated
+    /// HTTP events. The API/UI can turn this off for the calm default view.
+    pub include_plaintext: bool,
     /// Number of newest matching events to skip. This makes the next page
     /// point toward older history rather than newer events.
     pub offset: usize,
@@ -21,6 +24,7 @@ impl Default for TimelineFilter {
             pid: None,
             kind: None,
             connection_id: None,
+            include_plaintext: true,
             offset: 0,
             limit: 50,
         }
@@ -40,6 +44,7 @@ pub struct TimelinePage {
 pub struct ConnectionTimelineFilter {
     pub pid: Option<u32>,
     pub connection_id: Option<String>,
+    pub include_plaintext: bool,
     pub include_closed: bool,
     pub include_events: bool,
     pub event_limit: usize,
@@ -52,6 +57,7 @@ impl Default for ConnectionTimelineFilter {
         Self {
             pid: None,
             connection_id: None,
+            include_plaintext: true,
             include_closed: true,
             include_events: true,
             event_limit: 200,
@@ -120,6 +126,8 @@ pub struct TimelineEntry {
     pub plaintext: Option<String>,
     pub plaintext_bytes: Option<usize>,
     pub plaintext_truncated: bool,
+    pub plaintext_skipped: bool,
+    pub plaintext_skip_reason: Option<String>,
     pub http_direction: Option<HttpMessageDirection>,
     pub http_version: Option<String>,
     pub http_method: Option<String>,
@@ -129,6 +137,11 @@ pub struct TimelineEntry {
     pub http_reason: Option<String>,
     pub http_headers: Vec<HttpHeader>,
     pub http_content_length: Option<usize>,
+    pub http_body_preview: Option<String>,
+    pub http_body_bytes: usize,
+    pub http_body_truncated: bool,
+    pub http_payload_skipped: bool,
+    pub http_payload_skip_reason: Option<String>,
     pub file_path: Option<String>,
     pub file_bytes: Option<u64>,
 }
@@ -169,6 +182,8 @@ impl TimelineEntry {
             plaintext: None,
             plaintext_bytes: None,
             plaintext_truncated: false,
+            plaintext_skipped: false,
+            plaintext_skip_reason: None,
             http_direction: None,
             http_version: None,
             http_method: None,
@@ -178,6 +193,11 @@ impl TimelineEntry {
             http_reason: None,
             http_headers: Vec::new(),
             http_content_length: None,
+            http_body_preview: None,
+            http_body_bytes: 0,
+            http_body_truncated: false,
+            http_payload_skipped: false,
+            http_payload_skip_reason: None,
             file_path: None,
             file_bytes: None,
         };
@@ -279,6 +299,8 @@ impl TimelineEntry {
                 data,
                 bytes,
                 truncated,
+                payload_skipped,
+                payload_skip_reason,
             } => {
                 if let Some(connection) = event.connection.as_ref() {
                     entry.connection_id = Some(connection.id.clone());
@@ -296,6 +318,8 @@ impl TimelineEntry {
                 entry.plaintext = Some(data);
                 entry.plaintext_bytes = Some(bytes);
                 entry.plaintext_truncated = truncated;
+                entry.plaintext_skipped = payload_skipped;
+                entry.plaintext_skip_reason = payload_skip_reason;
                 let direction_label = match direction {
                     PlaintextDirection::Read => "read",
                     PlaintextDirection::Write => "write",
@@ -312,6 +336,8 @@ impl TimelineEntry {
                 data,
                 bytes,
                 truncated,
+                payload_skipped,
+                payload_skip_reason,
             } => {
                 entry.ssl_object = Some(ssl_object);
                 entry.fd = fd;
@@ -319,6 +345,8 @@ impl TimelineEntry {
                 entry.plaintext = Some(data);
                 entry.plaintext_bytes = Some(bytes);
                 entry.plaintext_truncated = truncated;
+                entry.plaintext_skipped = payload_skipped;
+                entry.plaintext_skip_reason = payload_skip_reason;
                 entry.summary = format!(
                     "HTTP capture {} · {} B{}",
                     match direction {
@@ -339,6 +367,11 @@ impl TimelineEntry {
                 reason,
                 headers,
                 content_length,
+                body_preview,
+                body_bytes,
+                body_truncated,
+                payload_skipped,
+                payload_skip_reason,
             } => {
                 if let Some(connection) = event.connection.as_ref() {
                     entry.connection_id = Some(connection.id.clone());
@@ -359,6 +392,11 @@ impl TimelineEntry {
                 entry.http_reason = reason;
                 entry.http_headers = headers;
                 entry.http_content_length = content_length;
+                entry.http_body_preview = body_preview;
+                entry.http_body_bytes = body_bytes;
+                entry.http_body_truncated = body_truncated;
+                entry.http_payload_skipped = payload_skipped;
+                entry.http_payload_skip_reason = payload_skip_reason;
                 entry.summary = match direction {
                     HttpMessageDirection::Request => format!(
                         "HTTP request {} {}",

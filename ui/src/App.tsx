@@ -1,11 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 type Summary = {
   processes: number;
   connections: number;
   domains: number;
-  alerts: number;
   observation_level: string;
+  capture_state: "stopped" | "capturing";
+  capture_target: string;
+  event_count: number;
+};
+
+type ProcessCandidate = {
+  pid: number;
+  name: string;
+  command_line: string | null;
 };
 
 type ProcessRow = {
@@ -43,47 +51,6 @@ type ConnectionRow = {
   risk_score?: number;
 };
 
-type AlertRow = {
-  id: string;
-  event_id: string | null;
-  timestamp_ns: number;
-  severity: "low" | "medium" | "high" | "critical";
-  rule: string;
-  summary: string;
-  process_id: number | null;
-  process_name: string | null;
-  connection_id: string | null;
-  domain: string | null;
-  evidence: string[];
-  risk_score: number;
-};
-
-type GraphNode = {
-  id: string;
-  kind: "process" | "domain" | "connection" | "file";
-  label: string;
-  risk_score: number;
-  pid: number | null;
-  connection_id: string | null;
-  metadata: Record<string, string>;
-};
-
-type GraphEdge = {
-  id: string;
-  source: string;
-  target: string;
-  relation: string;
-  event_count: number;
-  first_seen_ns: number;
-  last_seen_ns: number;
-};
-
-type BehaviorGraph = {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  updated_at_ns: number;
-};
-
 type TimelineEntry = {
   id: string;
   timestamp_ns: number;
@@ -110,6 +77,8 @@ type TimelineEntry = {
   plaintext?: string | null;
   plaintext_bytes?: number | null;
   plaintext_truncated?: boolean;
+  plaintext_skipped?: boolean;
+  plaintext_skip_reason?: string | null;
   http_direction?: string | null;
   http_version?: string | null;
   http_method?: string | null;
@@ -119,6 +88,11 @@ type TimelineEntry = {
   http_reason?: string | null;
   http_headers?: Array<{ name: string; value: string }>;
   http_content_length?: number | null;
+  http_body_preview?: string | null;
+  http_body_bytes?: number;
+  http_body_truncated?: boolean;
+  http_payload_skipped?: boolean;
+  http_payload_skip_reason?: string | null;
   file_path?: string | null;
   file_bytes?: number | null;
 };
@@ -167,8 +141,6 @@ type Snapshot = {
   connections: ConnectionRow[];
   connection_timeline: ConnectionTimelinePage;
   timeline: TimelinePage;
-  alerts: AlertRow[];
-  graph: BehaviorGraph;
   mode: "demo" | "live";
 };
 
@@ -178,20 +150,86 @@ const CONNECTION_PAGE_SIZE = 20;
 const TIMELINE_PAGE_SIZE = 50;
 
 type SortDirection = "asc" | "desc";
-type ProcessSortKey = "name" | "pid" | "connections" | "traffic" | "level" | "risk";
-type ConnectionSortKey = "process" | "pid" | "remote" | "domain" | "state" | "traffic" | "last_seen" | "risk";
+type ProcessSortKey = "name" | "pid" | "connections" | "traffic" | "level";
+type ConnectionSortKey = "process" | "pid" | "remote" | "domain" | "state" | "traffic" | "last_seen";
+type ProcessColumnKey = ProcessSortKey | "inspect";
+type ConnectionColumnKey = ConnectionSortKey | "trace";
+type SessionColumnKey = "route" | "state" | "details" | "id" | "inspect";
+type WorkspaceView = "processes" | "connections" | "sessions" | "timeline";
 
 type SortState<Key extends string> = {
   key: Key;
   direction: SortDirection;
 };
 
+type ScrollAnchor = {
+  key: string;
+  offset: number;
+};
+
+type ScrollContainerSnapshot = {
+  element: HTMLDivElement;
+  top: number;
+  left: number;
+  atStart: boolean;
+  anchor: ScrollAnchor | null;
+};
+
+type ScrollSnapshot = {
+  windowX: number;
+  windowY: number;
+  containers: ScrollContainerSnapshot[];
+};
+
+type CaptureTargetSelection = {
+  mode: "pid" | "name" | "global";
+  pid?: string;
+  name?: string;
+};
+
+const workspaceTabs: Array<{ id: WorkspaceView; label: string; hint: string }> = [
+  { id: "connections", label: "Connections", hint: "network edges" },
+  { id: "processes", label: "Processes", hint: "live inventory" },
+  { id: "sessions", label: "Sessions", hint: "connection activity" },
+  { id: "timeline", label: "Raw events", hint: "advanced view" },
+];
+
+const defaultProcessColumnWidths: Record<ProcessColumnKey, number> = {
+  name: 190,
+  pid: 90,
+  connections: 110,
+  traffic: 120,
+  level: 120,
+  inspect: 180,
+};
+
+const defaultConnectionColumnWidths: Record<ConnectionColumnKey, number> = {
+  process: 180,
+  pid: 80,
+  remote: 180,
+  domain: 180,
+  state: 130,
+  traffic: 130,
+  last_seen: 130,
+  trace: 100,
+};
+
+const defaultSessionColumnWidths: Record<SessionColumnKey, number> = {
+  route: 270,
+  state: 110,
+  details: 450,
+  id: 230,
+  inspect: 110,
+};
+
 const demoSummary: Summary = {
   processes: 4,
   connections: 54,
   domains: 31,
-  alerts: 1,
   observation_level: "L1",
+  capture_state: "capturing",
+  capture_target: "global",
+  event_count: 3,
 };
 
 const demoProcesses: ProcessRow[] = [
@@ -256,8 +294,6 @@ const initialSnapshot: Snapshot = {
     limit: 50,
     has_more: false,
   },
-  alerts: [],
-  graph: { nodes: [], edges: [], updated_at_ns: 0 },
   mode: "demo",
 };
 
@@ -269,25 +305,39 @@ async function fetchJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function buildTimelinePath(kind: string, pid: string, connectionId: string, offset: number): string {
-  const params = new URLSearchParams({ limit: String(TIMELINE_PAGE_SIZE), offset: String(offset) });
+function parseCaptureTarget(target: string): CaptureTargetSelection {
+  if (target === "global") return { mode: "global" };
+  const pid = target.match(/^process:(\d+)$/)?.[1];
+  if (pid) return { mode: "pid", pid };
+  const name = target.match(/^process-name:(.+)$/)?.[1];
+  if (name) return { mode: "name", name };
+  return { mode: "global" };
+}
+
+function buildTimelinePath(kind: string, pid: string, connectionId: string, offset: number, includePlaintext: boolean): string {
+  const params = new URLSearchParams({
+    limit: String(TIMELINE_PAGE_SIZE),
+    offset: String(offset),
+    include_plaintext: String(includePlaintext),
+  });
   if (kind !== "all") params.set("kind", kind);
   if (/^\d+$/.test(pid.trim())) params.set("pid", pid.trim());
   if (connectionId.trim()) params.set("connection_id", connectionId.trim());
   return `/api/timeline?${params.toString()}`;
 }
 
-function buildConnectionTimelinePath(offset: number, includeClosed: boolean): string {
+function buildConnectionTimelinePath(offset: number, includeClosed: boolean, includePlaintext: boolean): string {
   const params = new URLSearchParams({
     limit: "20",
     offset: String(offset),
     include_closed: String(includeClosed),
     include_events: "false",
+    include_plaintext: String(includePlaintext),
   });
   return `/api/connection-timeline?${params.toString()}`;
 }
 
-function buildConnectionDetailPath(connectionId: string): string {
+function buildConnectionDetailPath(connectionId: string, includePlaintext: boolean): string {
   const params = new URLSearchParams({
     limit: "1",
     offset: "0",
@@ -295,6 +345,7 @@ function buildConnectionDetailPath(connectionId: string): string {
     include_events: "true",
     event_limit: "200",
     connection_id: connectionId,
+    include_plaintext: String(includePlaintext),
   });
   return `/api/connection-timeline?${params.toString()}`;
 }
@@ -348,20 +399,50 @@ function nextSortState<Key extends string>(current: SortState<Key>, key: Key): S
     : { key, direction: "asc" };
 }
 
+function ColumnResizer({
+  label,
+  onResizeStart,
+}: {
+  label: string;
+  onResizeStart: (clientX: number) => void;
+}) {
+  return (
+    <span
+      className="column-resizer"
+      role="separator"
+      aria-label={`Resize ${label} column`}
+      title={`Drag to resize ${label}`}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onResizeStart(event.clientX);
+      }}
+    />
+  );
+}
+
 function SortableHeader<Key extends string>({
   label,
   column,
   sort,
   onSort,
+  width,
+  onResizeStart,
 }: {
   label: string;
   column: Key;
   sort: SortState<Key>;
   onSort: (column: Key) => void;
+  width?: number;
+  onResizeStart?: (clientX: number) => void;
 }) {
   const active = sort.key === column;
   return (
-    <th scope="col" aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
+    <th
+      scope="col"
+      style={width ? { width: `${width}px` } : undefined}
+      aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}
+    >
       <button
         type="button"
         className={`sort-button ${active ? "active" : ""}`}
@@ -371,6 +452,7 @@ function SortableHeader<Key extends string>({
         <span>{label}</span>
         <span className="sort-indicator" aria-hidden="true">{active ? (sort.direction === "asc" ? "↑" : "↓") : "↕"}</span>
       </button>
+      {onResizeStart && <ColumnResizer label={label} onResizeStart={onResizeStart} />}
     </th>
   );
 }
@@ -413,95 +495,6 @@ function TablePagination({
   );
 }
 
-function BehaviorGraphView({
-  graph,
-  onNodeClick,
-}: {
-  graph: BehaviorGraph;
-  onNodeClick: (node: GraphNode) => void;
-}) {
-  const positions = useMemo(() => {
-    const result = new Map<string, { x: number; y: number }>();
-    const columns: GraphNode["kind"][] = ["process", "connection"];
-    const xByKind: Record<GraphNode["kind"], number> = {
-      process: 120,
-      connection: 380,
-      domain: 650,
-      file: 650,
-    };
-    for (const kind of columns) {
-      const nodes = graph.nodes.filter((node) => node.kind === kind).slice(0, kind === "process" ? 4 : 5);
-      nodes.forEach((node, index) => {
-        result.set(node.id, { x: xByKind[kind], y: 44 + index * 52 });
-      });
-    }
-    graph.nodes
-      .filter((node) => node.kind === "domain" || node.kind === "file")
-      .slice(0, 6)
-      .forEach((node, index) => {
-        result.set(node.id, { x: 650, y: 44 + index * 46 });
-      });
-    return result;
-  }, [graph.nodes]);
-  if (graph.nodes.length === 0) {
-    return <div className="graph-empty"><span>⌘</span><p>关系图会在进程产生网络、域名或文件事件后出现。</p></div>;
-  }
-  const visibleEdges = graph.edges.filter((edge) => positions.has(edge.source) && positions.has(edge.target));
-  return (
-    <div className="graph-canvas" role="img" aria-label="Process behavior graph">
-      <svg viewBox="0 0 780 330" preserveAspectRatio="xMidYMid meet">
-        <defs>
-          <marker id="graph-arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L7,3 z" fill="#45606b" />
-          </marker>
-        </defs>
-        {visibleEdges.map((edge) => {
-          const source = positions.get(edge.source);
-          const target = positions.get(edge.target);
-          if (!source || !target) return null;
-          return (
-            <g key={edge.id} className="graph-edge">
-              <line x1={source.x} y1={source.y} x2={target.x} y2={target.y} markerEnd="url(#graph-arrow)" />
-              <text x={(source.x + target.x) / 2} y={(source.y + target.y) / 2 - 5}>{edge.relation}</text>
-            </g>
-          );
-        })}
-        {graph.nodes.map((node) => {
-          const position = positions.get(node.id);
-          if (!position) return null;
-          const label = node.label.length > 24 ? `${node.label.slice(0, 22)}…` : node.label;
-          return (
-            <g
-              key={node.id}
-              className={`graph-node graph-node-${node.kind}`}
-              transform={`translate(${position.x}, ${position.y})`}
-              tabIndex={0}
-              role="button"
-              aria-label={`${node.kind}: ${node.label}`}
-              onClick={() => onNodeClick(node)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") onNodeClick(node);
-              }}
-            >
-              <rect x="-92" y="-20" width="184" height="40" rx="9" />
-              <text className="graph-node-kind" x="-80" y="-5">{node.kind.toUpperCase()}</text>
-              <text className="graph-node-label" x="-80" y="11">{label}</text>
-              {node.risk_score > 0 && <text className="graph-node-risk" x="78" y="-5">R{Math.round(node.risk_score)}</text>}
-              <title>{node.label}{node.risk_score > 0 ? ` · risk ${Math.round(node.risk_score)}` : ""}</title>
-            </g>
-          );
-        })}
-      </svg>
-      <div className="graph-legend">
-        <span><i className="legend-dot legend-process" />Process</span>
-        <span><i className="legend-dot legend-connection" />Connection</span>
-        <span><i className="legend-dot legend-domain" />Domain</span>
-        <span><i className="legend-dot legend-file" />File</span>
-      </div>
-    </div>
-  );
-}
-
 function stateLabel(state: string): string {
   return state
     .split("_")
@@ -522,6 +515,12 @@ function timelineDetail(entry: TimelineEntry): string {
     return `${entry.file_path}${entry.file_bytes ? ` · ${formatBytes(entry.file_bytes)}` : ""}`;
   }
   if (entry.http_direction) {
+    const contentType = entry.http_headers?.find((header) => header.name.toLowerCase() === "content-type")?.value;
+    const type = contentType ? ` · ${contentType}` : "";
+    const bodyBytes = entry.http_body_bytes ? ` · body ${formatBytes(entry.http_body_bytes)} assembled` : "";
+    const payload = entry.http_payload_skipped
+      ? ` · payload skipped (${stateLabel(entry.http_payload_skip_reason ?? "unsupported")})`
+      : bodyBytes;
     if (entry.http_direction === "request") {
       const target = entry.http_target ?? "?";
       const host = entry.http_host ? ` · Host ${entry.http_host}` : "";
@@ -529,17 +528,20 @@ function timelineDetail(entry: TimelineEntry): string {
       const body = entry.http_content_length !== null && entry.http_content_length !== undefined
         ? ` · ${formatBytes(entry.http_content_length)}`
         : "";
-      return `${entry.http_method ?? "?"} ${target}${host}${headers}${body}`;
+      return `${entry.http_method ?? "?"} ${target}${host}${headers}${body}${type}${payload}`;
     }
     const reason = entry.http_reason ? ` ${entry.http_reason}` : "";
     const headers = entry.http_headers?.length ? ` · ${entry.http_headers.length} headers` : "";
     const body = entry.http_content_length !== null && entry.http_content_length !== undefined
       ? ` · ${formatBytes(entry.http_content_length)}`
       : "";
-    return `${entry.http_status ?? "?"}${reason}${headers}${body}`;
+    return `${entry.http_status ?? "?"}${reason}${headers}${body}${type}${payload}`;
   }
   if (entry.plaintext !== null && entry.plaintext !== undefined) {
     const direction = entry.plaintext_direction ? stateLabel(entry.plaintext_direction) : "Plaintext";
+    if (entry.plaintext_skipped) {
+      return `${direction}: payload skipped (${stateLabel(entry.plaintext_skip_reason ?? "unsupported")}) · ${formatBytes(entry.plaintext_bytes ?? 0)}`;
+    }
     return `${direction}: ${entry.plaintext}${entry.plaintext_truncated ? " · truncated" : ""}`;
   }
   if (entry.addresses.length > 0) return entry.addresses.join(", ");
@@ -549,13 +551,43 @@ function timelineDetail(entry: TimelineEntry): string {
   return entry.domain ?? entry.protocol ?? "metadata event";
 }
 
+function timelineBody(entry: TimelineEntry): string | null {
+  if (entry.http_payload_skipped || !entry.http_body_preview) return null;
+  return entry.http_body_preview;
+}
+
+function canInspectPayload(entry: TimelineEntry): boolean {
+  return Boolean(entry.http_direction || entry.kind === "http" || entry.kind === "plaintext");
+}
+
+function payloadContent(entry: TimelineEntry): string | null {
+  if (entry.http_direction || entry.kind === "http") {
+    return entry.http_payload_skipped ? null : entry.http_body_preview ?? null;
+  }
+  return entry.plaintext_skipped ? null : entry.plaintext ?? null;
+}
+
+function payloadTitle(entry: TimelineEntry): string {
+  if (entry.http_direction === "request") {
+    return `${entry.http_method ?? "HTTP"} ${entry.http_target ?? "/"}`;
+  }
+  if (entry.http_direction === "response") {
+    return `HTTP ${entry.http_status ?? "?"}${entry.http_reason ? ` ${entry.http_reason}` : ""}`;
+  }
+  return `${stateLabel(entry.plaintext_direction ?? "plaintext")} payload`;
+}
+
+function payloadBytes(entry: TimelineEntry): number | null {
+  return entry.http_body_bytes ?? entry.plaintext_bytes ?? null;
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot);
   const [refreshing, setRefreshing] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [showClosedConnections, setShowClosedConnections] = useState(false);
+  const [showPlaintextFragments, setShowPlaintextFragments] = useState(false);
   const [timelineKind, setTimelineKind] = useState("all");
   const [timelinePidInput, setTimelinePidInput] = useState("");
   const [timelinePid, setTimelinePid] = useState("");
@@ -563,24 +595,179 @@ function App() {
   const [timelineConnection, setTimelineConnection] = useState("");
   const [observationBusyPid, setObservationBusyPid] = useState<number | null>(null);
   const [observationError, setObservationError] = useState<string | null>(null);
+  const [processCandidates, setProcessCandidates] = useState<ProcessCandidate[]>([]);
+  const [captureTargetMode, setCaptureTargetMode] = useState<"pid" | "name" | "global">("pid");
+  const [capturePidInput, setCapturePidInput] = useState("");
+  const [captureNameInput, setCaptureNameInput] = useState("");
+  const [captureLevel, setCaptureLevel] = useState("L4");
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [captureError, setCaptureError] = useState<string | null>(null);
+  const [captureWorkspaceActive, setCaptureWorkspaceActive] = useState(false);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [connectionEventsLoadingId, setConnectionEventsLoadingId] = useState<string | null>(null);
+  const [selectedPayloadEntry, setSelectedPayloadEntry] = useState<TimelineEntry | null>(null);
   const [processSort, setProcessSort] = useState<SortState<ProcessSortKey>>({ key: "connections", direction: "desc" });
+  const [processColumnWidths, setProcessColumnWidths] = useState<Record<ProcessColumnKey, number>>(defaultProcessColumnWidths);
   const [processPageIndex, setProcessPageIndex] = useState(0);
   const [connectionSort, setConnectionSort] = useState<SortState<ConnectionSortKey>>({ key: "last_seen", direction: "desc" });
+  const [connectionColumnWidths, setConnectionColumnWidths] = useState<Record<ConnectionColumnKey, number>>(defaultConnectionColumnWidths);
   const [connectionTimelineOffset, setConnectionTimelineOffset] = useState(0);
+  const [sessionColumnWidths, setSessionColumnWidths] = useState<Record<SessionColumnKey, number>>(defaultSessionColumnWidths);
   const [connectionPageIndex, setConnectionPageIndex] = useState(0);
   const [timelineOffset, setTimelineOffset] = useState(0);
   const [selectedConnectionCache, setSelectedConnectionCache] = useState<ConnectionTimeline | null>(null);
+  const [activeView, setActiveView] = useState<WorkspaceView>("connections");
   const refreshingRef = useRef(false);
+  const columnResizeCleanupRef = useRef<(() => void) | null>(null);
+  const processTableRef = useRef<HTMLDivElement>(null);
+  const connectionTableRef = useRef<HTMLDivElement>(null);
+  const sessionListRef = useRef<HTMLDivElement>(null);
+  const timelineListRef = useRef<HTMLDivElement>(null);
+  const pendingScrollSnapshotRef = useRef<ScrollSnapshot | null>(null);
+
+  const beginProcessColumnResize = useCallback((column: ProcessColumnKey, clientX: number) => {
+    columnResizeCleanupRef.current?.();
+    const startWidth = processColumnWidths[column];
+    const handleMove = (event: PointerEvent) => {
+      const nextWidth = Math.max(72, Math.round(startWidth + event.clientX - clientX));
+      setProcessColumnWidths((current) => current[column] === nextWidth
+        ? current
+        : { ...current, [column]: nextWidth });
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", cleanup);
+      document.body.classList.remove("column-resizing");
+      if (columnResizeCleanupRef.current === cleanup) columnResizeCleanupRef.current = null;
+    };
+    columnResizeCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", cleanup);
+    document.body.classList.add("column-resizing");
+  }, [processColumnWidths]);
+
+  const beginConnectionColumnResize = useCallback((column: ConnectionColumnKey, clientX: number) => {
+    columnResizeCleanupRef.current?.();
+    const startWidth = connectionColumnWidths[column];
+    const handleMove = (event: PointerEvent) => {
+      const nextWidth = Math.max(72, Math.round(startWidth + event.clientX - clientX));
+      setConnectionColumnWidths((current) => current[column] === nextWidth
+        ? current
+        : { ...current, [column]: nextWidth });
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", cleanup);
+      document.body.classList.remove("column-resizing");
+      if (columnResizeCleanupRef.current === cleanup) columnResizeCleanupRef.current = null;
+    };
+    columnResizeCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", cleanup);
+    document.body.classList.add("column-resizing");
+  }, [connectionColumnWidths]);
+
+  const beginSessionColumnResize = useCallback((column: SessionColumnKey, clientX: number) => {
+    columnResizeCleanupRef.current?.();
+    const startWidth = sessionColumnWidths[column];
+    const handleMove = (event: PointerEvent) => {
+      const nextWidth = Math.max(90, Math.round(startWidth + event.clientX - clientX));
+      setSessionColumnWidths((current) => current[column] === nextWidth
+        ? current
+        : { ...current, [column]: nextWidth });
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", cleanup);
+      document.body.classList.remove("column-resizing");
+      if (columnResizeCleanupRef.current === cleanup) columnResizeCleanupRef.current = null;
+    };
+    columnResizeCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", cleanup);
+    document.body.classList.add("column-resizing");
+  }, [sessionColumnWidths]);
+
+  useEffect(() => () => columnResizeCleanupRef.current?.(), []);
+
+  const captureScrollSnapshot = useCallback((): ScrollSnapshot => {
+    const containers = [
+      processTableRef.current,
+      connectionTableRef.current,
+      sessionListRef.current,
+      timelineListRef.current,
+    ].filter((element): element is HTMLDivElement => element !== null);
+
+    return {
+      windowX: window.scrollX,
+      windowY: window.scrollY,
+      containers: containers.map((element) => {
+        const containerRect = element.getBoundingClientRect();
+        const anchor = Array.from(element.querySelectorAll<HTMLElement>("[data-scroll-key]"))
+          .map((candidate) => ({ candidate, rect: candidate.getBoundingClientRect() }))
+          .find(({ rect }) => rect.bottom > containerRect.top && rect.top < containerRect.bottom);
+
+        return {
+          element,
+          top: element.scrollTop,
+          left: element.scrollLeft,
+          atStart: element.scrollTop <= 1,
+          anchor: anchor
+            ? {
+                key: anchor.candidate.dataset.scrollKey ?? "",
+                offset: anchor.rect.top - containerRect.top,
+              }
+            : null,
+        };
+      }),
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const pending = pendingScrollSnapshotRef.current;
+    if (!pending) return;
+    pendingScrollSnapshotRef.current = null;
+
+    window.scrollTo(pending.windowX, pending.windowY);
+    pending.containers.forEach((saved) => {
+      const container = saved.element;
+      if (!container.isConnected) return;
+
+      if (saved.atStart || !saved.anchor?.key) {
+        container.scrollTop = saved.top;
+        container.scrollLeft = saved.left;
+        return;
+      }
+
+      const anchor = Array.from(container.querySelectorAll<HTMLElement>("[data-scroll-key]"))
+        .find((candidate) => candidate.dataset.scrollKey === saved.anchor?.key);
+      if (!anchor) {
+        container.scrollTop = saved.top;
+        container.scrollLeft = saved.left;
+        return;
+      }
+
+      const containerRect = container.getBoundingClientRect();
+      const currentOffset = anchor.getBoundingClientRect().top - containerRect.top;
+      container.scrollTop += currentOffset - saved.anchor.offset;
+      container.scrollLeft = saved.left;
+    });
+  }, [snapshot]);
 
   const timelineRequestPath = useMemo(
-    () => buildTimelinePath(timelineKind, timelinePid, timelineConnection, timelineOffset),
-    [timelineConnection, timelineKind, timelineOffset, timelinePid],
+    () => buildTimelinePath(
+      timelineKind,
+      timelinePid,
+      timelineConnection,
+      timelineOffset,
+      showPlaintextFragments || timelineKind === "plaintext",
+    ),
+    [showPlaintextFragments, timelineConnection, timelineKind, timelineOffset, timelinePid],
   );
   const connectionTimelineRequestPath = useMemo(
-    () => buildConnectionTimelinePath(connectionTimelineOffset, showClosedConnections),
-    [connectionTimelineOffset, showClosedConnections],
+    () => buildConnectionTimelinePath(connectionTimelineOffset, showClosedConnections, showPlaintextFragments),
+    [connectionTimelineOffset, showClosedConnections, showPlaintextFragments],
   );
 
   const refresh = useCallback(async () => {
@@ -589,53 +776,63 @@ function App() {
     setRefreshing(true);
     setRefreshError(null);
     try {
-      const [summary, processes, connections, connectionTimeline, timeline, alerts, graph] = await Promise.all([
+      const needsCandidates = snapshot.mode !== "live"
+        || (snapshot.summary.capture_state === "stopped" && !captureWorkspaceActive);
+      const [summary, processes, connections, connectionTimeline, timeline, candidates] = await Promise.all([
         fetchJson<Summary>("/api/summary"),
-        fetchJson<ProcessRow[]>("/api/processes"),
-        fetchJson<ConnectionRow[]>("/api/connections"),
-        fetchJson<ConnectionTimelinePage>(connectionTimelineRequestPath),
-        fetchJson<TimelinePage>(timelineRequestPath),
-        fetchJson<AlertRow[]>('/api/alerts?limit=100'),
-        fetchJson<BehaviorGraph>('/api/graph'),
+        activeView === "processes" ? fetchJson<ProcessRow[]>("/api/processes") : Promise.resolve(null),
+        activeView === "connections" ? fetchJson<ConnectionRow[]>("/api/connections") : Promise.resolve(null),
+        activeView === "sessions" ? fetchJson<ConnectionTimelinePage>(connectionTimelineRequestPath) : Promise.resolve(null),
+        activeView === "timeline" ? fetchJson<TimelinePage>(timelineRequestPath) : Promise.resolve(null),
+        needsCandidates ? fetchJson<ProcessCandidate[]>('/api/process-candidates') : Promise.resolve(null),
       ]);
+      // Capture immediately before replacing the live lists so a user who
+      // scrolls while the API is responding does not get pulled back to an
+      // older position.
+      pendingScrollSnapshotRef.current = captureScrollSnapshot();
+      if (candidates) setProcessCandidates(candidates);
       setSnapshot((current) => ({
+        ...current,
         summary,
-        processes,
-        connections,
-        connection_timeline: {
-          ...connectionTimeline,
-          sessions: connectionTimeline.sessions.map((session) => {
-            const previous = current.connection_timeline.sessions.find((item) => item.id === session.id);
-            return previous && previous.events.length > session.events.length
-              ? { ...session, events: previous.events }
-              : session;
-          }),
-        },
-        timeline,
-        alerts,
-        graph,
+        processes: processes ?? current.processes,
+        connections: connections ?? current.connections,
+        connection_timeline: connectionTimeline
+          ? {
+              ...connectionTimeline,
+              sessions: connectionTimeline.sessions.map((session) => {
+                const previous = current.connection_timeline.sessions.find((item) => item.id === session.id);
+                const previousEvents = previous?.events.filter((event) => showPlaintextFragments || event.kind !== "plaintext") ?? [];
+                return previous && previousEvents.length > session.events.length
+                  ? { ...session, events: previousEvents }
+                  : session;
+              }),
+            }
+          : current.connection_timeline,
+        timeline: timeline ?? current.timeline,
         mode: "live",
       }));
-      setSelectedConnectionCache((current) => {
-        if (!current) return null;
-        return connectionTimeline.sessions.find((session) => session.id === current.id) ?? current;
-      });
-      setConnectionTimelineOffset(connectionTimeline.offset);
-      setTimelineOffset(timeline.offset);
-      setLastUpdated(new Date());
+      if (connectionTimeline) {
+        setSelectedConnectionCache((current) => {
+          if (!current) return null;
+          return connectionTimeline.sessions.find((session) => session.id === current.id) ?? current;
+        });
+        setConnectionTimelineOffset(connectionTimeline.offset);
+      }
+      if (timeline) setTimelineOffset(timeline.offset);
     } catch {
       setRefreshError("Core 暂时不可用，保留当前画面");
+      pendingScrollSnapshotRef.current = captureScrollSnapshot();
       setSnapshot((current) => ({ ...current, mode: current.mode === "live" ? "live" : "demo" }));
     } finally {
       refreshingRef.current = false;
       setRefreshing(false);
     }
-  }, [connectionTimelineRequestPath, timelineRequestPath]);
+  }, [activeView, captureScrollSnapshot, captureWorkspaceActive, connectionTimelineRequestPath, snapshot.mode, snapshot.summary.capture_state, showPlaintextFragments, timelineRequestPath]);
 
-  const loadConnectionEvents = useCallback(async (connectionId: string) => {
+  const loadConnectionEvents = useCallback(async (connectionId: string, includePlaintext: boolean) => {
     setConnectionEventsLoadingId(connectionId);
     try {
-      const detail = await fetchJson<ConnectionTimelinePage>(buildConnectionDetailPath(connectionId));
+      const detail = await fetchJson<ConnectionTimelinePage>(buildConnectionDetailPath(connectionId, includePlaintext));
       const session = detail.sessions.find((item) => item.id === connectionId);
       if (session) {
         setSelectedConnectionCache(session);
@@ -663,9 +860,9 @@ function App() {
     setSelectedConnectionId(session.id);
     setSelectedConnectionCache(session);
     if (snapshot.mode === "live" && session.event_count > 0 && session.events.length === 0) {
-      void loadConnectionEvents(session.id);
+      void loadConnectionEvents(session.id, showPlaintextFragments);
     }
-  }, [loadConnectionEvents, selectedConnectionId, snapshot.mode]);
+  }, [loadConnectionEvents, selectedConnectionId, showPlaintextFragments, snapshot.mode]);
 
   const applyTimelineFilters = useCallback(() => {
     setTimelinePid(timelinePidInput.trim());
@@ -681,6 +878,134 @@ function App() {
     setTimelineConnection("");
     setTimelineOffset(0);
   }, []);
+
+  const postCommand = useCallback(async (path: string, body?: unknown) => {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(message || `${path}: ${response.status}`);
+    }
+  }, []);
+
+  const setGlobalObservationLevel = useCallback(async (level: string) => {
+    setCaptureError(null);
+    try {
+      const numericLevel = Number(level.replace(/^L/i, ""));
+      if (!Number.isInteger(numericLevel) || numericLevel < 1 || numericLevel > 5) {
+        throw new Error("invalid observation level");
+      }
+      await postCommand("/api/observations/default", { level: numericLevel });
+      const captureTarget = snapshot.mode === "live" ? snapshot.summary.capture_target : "global";
+      if (captureTarget !== "global") {
+        // The default level is only a baseline; an earlier exact target
+        // override (for example process-name:curl at L4) would otherwise
+        // keep HTTP/plaintext probes attached after selecting L3.
+        await postCommand("/api/observations", {
+          target: captureTarget,
+          level: numericLevel,
+          exact: true,
+          persistent: true,
+        });
+      }
+      await refresh();
+    } catch (error) {
+      setCaptureError(error instanceof Error ? error.message : "global observation command failed");
+    }
+  }, [postCommand, refresh, snapshot.mode, snapshot.summary.capture_target]);
+
+  const resetCapture = useCallback(async () => {
+    if (resetBusy) return;
+    setResetBusy(true);
+    setCaptureError(null);
+    try {
+      await postCommand("/api/capture/reset");
+      setCaptureWorkspaceActive(true);
+      setSelectedConnectionId(null);
+      setSelectedConnectionCache(null);
+      setSelectedPayloadEntry(null);
+      setConnectionTimelineOffset(0);
+      setTimelineOffset(0);
+      // Do not hold the button hostage to every read endpoint. The reset
+      // command has already completed; refresh the workspace in the
+      // background and let the control become usable immediately.
+      void refresh();
+    } catch (error) {
+      setCaptureError(error instanceof Error ? error.message : "capture reset failed");
+    } finally {
+      setResetBusy(false);
+    }
+  }, [postCommand, refresh, resetBusy]);
+
+  const runCaptureCommand = useCallback(async (action: "start" | "stop") => {
+    setCaptureBusy(true);
+    setCaptureError(null);
+    try {
+      let captureTarget = "global";
+      let numericLevel: number | undefined;
+      if (action === "start") {
+        // With existing events, the top-bar button resumes the current
+        // session. Reuse Core's target instead of requiring the hidden
+        // capture form to be filled again.
+        const existingTarget = snapshot.mode === "live" && snapshot.summary.event_count > 0
+          ? parseCaptureTarget(snapshot.summary.capture_target)
+          : null;
+        const selection = existingTarget ?? {
+          mode: captureTargetMode,
+          pid: capturePidInput.trim(),
+          name: captureNameInput.trim(),
+        };
+        if (!existingTarget) {
+          numericLevel = Number(captureLevel.replace(/^L/i, ""));
+          if (!Number.isInteger(numericLevel) || numericLevel < 1 || numericLevel > 5) {
+            throw new Error("invalid observation level");
+          }
+        }
+        if (selection.mode === "global") {
+          if (numericLevel !== undefined) {
+            await postCommand("/api/observations/default", { level: numericLevel });
+          }
+        } else if (selection.mode === "pid") {
+          const pid = Number(selection.pid);
+          if (!Number.isInteger(pid) || pid <= 0) throw new Error("请输入有效 PID");
+          captureTarget = `process:${pid}`;
+          if (numericLevel !== undefined) {
+            await postCommand("/api/observations", {
+              target: captureTarget,
+              level: numericLevel,
+              exact: true,
+              persistent: true,
+            });
+          }
+        } else {
+          const name = selection.name;
+          if (!name) throw new Error("请输入进程名");
+          captureTarget = `process-name:${name}`;
+          if (numericLevel !== undefined) {
+            await postCommand("/api/observations", {
+              target: captureTarget,
+              level: numericLevel,
+              exact: true,
+              persistent: true,
+            });
+          }
+        }
+      }
+      await postCommand(
+        `/api/capture/${action}`,
+        action === "start" ? { target: captureTarget, level: numericLevel } : undefined,
+      );
+      setCaptureWorkspaceActive(action === "start");
+      await refresh();
+    } catch (error) {
+      setCaptureError(error instanceof Error ? error.message : "capture command failed");
+    } finally {
+      setCaptureBusy(false);
+    }
+  }, [captureLevel, captureNameInput, capturePidInput, captureTargetMode, postCommand, refresh, snapshot.mode, snapshot.summary.capture_target, snapshot.summary.event_count]);
 
   const setObservationLevel = useCallback(async (pid: number, level: string) => {
     setObservationBusyPid(pid);
@@ -712,22 +1037,34 @@ function App() {
   }, [refresh]);
 
   useEffect(() => {
+    if (snapshot.mode !== "live") return;
+    const selection = parseCaptureTarget(snapshot.summary.capture_target);
+    setCaptureTargetMode(selection.mode);
+    if (selection.mode === "pid" && selection.pid) setCapturePidInput(selection.pid);
+    if (selection.mode === "name" && selection.name) setCaptureNameInput(selection.name);
+  }, [snapshot.mode, snapshot.summary.capture_target]);
+
+  useEffect(() => {
     if (!autoRefresh) return undefined;
-    const timer = window.setInterval(() => void refresh(), 5000);
+    const timer = window.setInterval(() => void refresh(), 1000);
     return () => window.clearInterval(timer);
   }, [autoRefresh, refresh]);
 
   useEffect(() => {
-    if (!selectedConnectionId) return undefined;
+    if (!selectedConnectionId && !selectedPayloadEntry) return undefined;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setSelectedConnectionId(null);
-        setSelectedConnectionCache(null);
+        if (selectedPayloadEntry) {
+          setSelectedPayloadEntry(null);
+        } else {
+          setSelectedConnectionId(null);
+          setSelectedConnectionCache(null);
+        }
       }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [selectedConnectionId]);
+  }, [selectedConnectionId, selectedPayloadEntry]);
 
   const processNames = useMemo(
     () => new Map(snapshot.processes.map((process) => [process.pid, process.name])),
@@ -743,7 +1080,6 @@ function App() {
           case "connections": return process.connections;
           case "traffic": return process.sent_bytes + process.received_bytes;
           case "level": return process.level;
-          case "risk": return process.risk_score ?? 0;
         }
       };
       const result = compareSortableValues(valueFor(left), valueFor(right));
@@ -779,7 +1115,6 @@ function App() {
             case "state": return connection.tcp_state ?? connection.state;
             case "traffic": return connection.sent_bytes + connection.received_bytes;
             case "last_seen": return connection.last_seen_ns ?? connection.first_seen_ns ?? 0;
-            case "risk": return connection.risk_score ?? 0;
           }
         };
         const result = compareSortableValues(valueFor(left), valueFor(right));
@@ -824,11 +1159,11 @@ function App() {
     const session = snapshot.connection_timeline.sessions.find((item) => item.id === connectionId);
     if (session) setSelectedConnectionCache(session);
     if (snapshot.mode === "live" && (!session || session.event_count > 0 && session.events.length === 0)) {
-      void loadConnectionEvents(connectionId);
+      void loadConnectionEvents(connectionId, showPlaintextFragments);
     }
     setTimelineConnectionInput(connectionId);
     setTimelineConnection(connectionId);
-  }, [loadConnectionEvents, snapshot.connection_timeline.sessions, snapshot.mode]);
+  }, [loadConnectionEvents, showPlaintextFragments, snapshot.connection_timeline.sessions, snapshot.mode]);
   const selectedConnection = useMemo(
     () => selectedConnectionId
       ? snapshot.connection_timeline.sessions.find((session) => session.id === selectedConnectionId) ?? selectedConnectionCache
@@ -843,9 +1178,148 @@ function App() {
     setConnectionSort((current) => nextSortState(current, column));
     setConnectionPageIndex(0);
   }, []);
+  const processTableWidth = Object.values(processColumnWidths).reduce((total, width) => total + width, 0);
+  const connectionTableWidth = Object.values(connectionColumnWidths).reduce((total, width) => total + width, 0);
+  const sessionGridTemplate = Object.values(sessionColumnWidths).map((width) => `${width}px`).join(" ");
   const isLive = snapshot.mode === "live";
+  const isCapturing = isLive && snapshot.summary.capture_state === "capturing";
+  // The setup console is only for an idle Core. Once Start succeeds, show
+  // the capture workspace immediately even before the first event arrives.
+  const showCaptureConsole = isLive
+    && !captureWorkspaceActive
+    && snapshot.summary.capture_state === "stopped";
   const statusText = isLive ? "Core connected" : "Core offline · demo data";
-  const latestAlert = snapshot.alerts[0] ?? null;
+
+  if (showCaptureConsole) {
+    return (
+      <main className="shell capture-shell">
+        <header className="topbar">
+          <div className="brand"><span className="brand-mark">◌</span><span>TraceLens</span></div>
+          <div className={`runtime-status ${isLive ? "" : "offline"}`}>
+            <span className="status-dot" />
+            {statusText}
+            <span className={`capture-state capture-state-${snapshot.summary.capture_state}`}>
+            {isCapturing ? "CAPTURING" : "READY"}
+            </span>
+          </div>
+        </header>
+
+        <section className="capture-console panel">
+          <div className="capture-console-heading">
+            <div>
+              <p className="eyebrow">CAPTURE CONSOLE</p>
+              <h1>{isCapturing ? "Waiting for traffic" : "New capture"}</h1>
+              <p className="hero-copy">
+                {isCapturing
+                  ? "TraceLens is armed. Generate traffic in the selected target, then inspect the captured session below."
+                  : "Nothing is being collected yet. Choose one target and an observation level, then press Start capture."}
+              </p>
+            </div>
+            <div className={`capture-ready-mark ${isCapturing ? "active" : ""}`}>
+              <span className="status-dot" />
+              {isCapturing ? "LIVE" : "READY"}
+            </div>
+          </div>
+
+          <div className="capture-target-tabs" role="tablist" aria-label="Capture target">
+            {(["pid", "name", "global"] as const).map((mode) => (
+              <button
+                key={mode}
+                className={`capture-target-tab ${captureTargetMode === mode ? "active" : ""}`}
+                onClick={() => setCaptureTargetMode(mode)}
+                disabled={isCapturing || captureBusy}
+              >
+                {mode === "pid" ? "Selected PID" : mode === "name" ? "Process name" : "Global"}
+              </button>
+            ))}
+          </div>
+
+          <div className="capture-target-form">
+            {captureTargetMode === "pid" && (
+              <label className="capture-field">
+                <span>PID</span>
+                <input
+                  list="process-pid-candidates"
+                  value={capturePidInput}
+                  onChange={(event) => setCapturePidInput(event.target.value)}
+                  placeholder="例如 148042"
+                  inputMode="numeric"
+                  disabled={isCapturing || captureBusy}
+                />
+                <small>只追踪这个进程；进程退出后自动停止对应 probe。</small>
+              </label>
+            )}
+            {captureTargetMode === "name" && (
+              <label className="capture-field">
+                <span>Process name</span>
+                <input
+                  list="process-name-candidates"
+                  value={captureNameInput}
+                  onChange={(event) => setCaptureNameInput(event.target.value)}
+                  placeholder="例如 curl 或 node"
+                  disabled={isCapturing || captureBusy}
+                />
+                <small>匹配当前和之后启动的同名进程。</small>
+              </label>
+            )}
+            {captureTargetMode === "global" && (
+              <div className="capture-field capture-global-note">
+                <span>Global scope</span>
+                <p>对所有当前及之后出现的进程使用同一个观测等级。默认 L1，不采集明文。</p>
+              </div>
+            )}
+            <label className="capture-field capture-level-field">
+              <span>Observation level</span>
+              <select value={captureLevel} onChange={(event) => setCaptureLevel(event.target.value)} disabled={isCapturing || captureBusy}>
+                <option value="L1">L1 · metadata</option>
+                <option value="L2">L2 · reserved</option>
+                <option value="L3">L3 · TLS metadata</option>
+                <option value="L4">L4 · HTTP text</option>
+                <option value="L5">L5 · plaintext</option>
+              </select>
+            </label>
+          </div>
+
+          <datalist id="process-pid-candidates">
+            {processCandidates.map((process) => <option key={process.pid} value={process.pid}>{process.name}</option>)}
+          </datalist>
+          <datalist id="process-name-candidates">
+            {[...new Set(processCandidates.map((process) => process.name))].map((name) => <option key={name} value={name} />)}
+          </datalist>
+
+          <div className="capture-console-actions">
+            <button className="primary-button" onClick={() => void runCaptureCommand("start")} disabled={isCapturing || captureBusy}>
+              {captureBusy ? "Working…" : "Start capture"}
+            </button>
+            {isCapturing && <button className="ghost-button danger-button" onClick={() => void runCaptureCommand("stop")} disabled={captureBusy}>Stop</button>}
+            <button className="ghost-button danger-button" onClick={() => void resetCapture()} disabled={resetBusy}>{resetBusy ? "Resetting…" : "Reset & start new"}</button>
+            <span className="capture-console-hint">Captured events: 0 · memory only</span>
+          </div>
+          {captureError && <p className="error-note capture-error">{captureError}</p>}
+
+          <div className="process-picker">
+            <div className="process-picker-heading">
+              <div><p className="eyebrow">SYSTEM PROCESSES</p><h2>Quick select</h2></div>
+              <button className="ghost-button" onClick={() => void refresh()} disabled={refreshing}>Refresh list</button>
+            </div>
+            <div className="process-picker-list">
+              {processCandidates.slice(0, 36).map((process) => (
+                <button key={process.pid} className="process-picker-item" onClick={() => {
+                  setCaptureTargetMode("pid");
+                  setCapturePidInput(String(process.pid));
+                }} disabled={isCapturing || captureBusy}>
+                  <strong>{process.name}</strong><span>PID {process.pid}</span>
+                  {process.command_line && <small>{process.command_line}</small>}
+                </button>
+              ))}
+              {processCandidates.length === 0 && <p className="muted empty-cell">No readable system processes.</p>}
+            </div>
+          </div>
+        </section>
+        {refreshError && <p className="refresh-error">{refreshError}</p>}
+      </main>
+    );
+  }
 
   return (
     <main className="shell">
@@ -857,7 +1331,31 @@ function App() {
         <div className={`runtime-status ${isLive ? "" : "offline"}`}>
           <span className="status-dot" />
           {statusText}
-          <span className="refresh-status">{refreshing ? "syncing" : lastUpdated ? `updated ${lastUpdated.toLocaleTimeString()}` : "not synced"}</span>
+          {isLive && <span className={`capture-state capture-state-${snapshot.summary.capture_state}`}>
+            {isCapturing ? "CAPTURING" : "STOPPED"}
+          </span>}
+          {isLive && (
+            <div className="capture-session-actions">
+              <label className="global-level-control">
+                <span>Global</span>
+                <select
+                  value={snapshot.summary.observation_level}
+                  onChange={(event) => void setGlobalObservationLevel(event.target.value)}
+                  disabled={captureBusy}
+                  aria-label="Global observation level"
+                >
+                  <option value="L1">L1</option>
+                  <option value="L2">L2</option>
+                  <option value="L3">L3</option>
+                  <option value="L4">L4</option>
+                  <option value="L5">L5</option>
+                </select>
+              </label>
+              {isCapturing && <button className="topbar-stop-button" onClick={() => void runCaptureCommand("stop")} disabled={captureBusy}>Stop</button>}
+              {!isCapturing && <button className="topbar-capture-button" onClick={() => void runCaptureCommand("start")} disabled={captureBusy}>Start capture</button>}
+              <button className="topbar-reset-button" onClick={() => void resetCapture()} disabled={resetBusy}>{resetBusy ? "Resetting…" : "Reset"}</button>
+            </div>
+          )}
           <label className="auto-refresh-toggle">
             <input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} />
             live refresh
@@ -865,30 +1363,33 @@ function App() {
         </div>
       </header>
 
-      <section className="hero">
-        <div>
-          <p className="eyebrow">PROCESS-AWARE NETWORK OBSERVATION</p>
-          <h1>See the process behind every connection.</h1>
-          <p className="hero-copy">
-            A calm overview first. Deep inspection only when a process or
-            connection earns your attention.
-          </p>
-        </div>
-        <div className="hero-stat">
-          <span className="stat-label">OBSERVATION LEVEL</span>
-          <strong>{snapshot.summary.observation_level}</strong>
-          <span>metadata only</span>
-        </div>
-      </section>
-
       <section className="metrics">
         <div className="metric-card"><span>Processes</span><strong>{snapshot.summary.processes}</strong><small>being observed</small></div>
         <div className="metric-card"><span>Connections</span><strong>{snapshot.summary.connections}</strong><small>active network edges</small></div>
         <div className="metric-card"><span>Domains</span><strong>{snapshot.summary.domains}</strong><small>correlated from DNS</small></div>
-        <div className="metric-card alert-card"><span>Alerts</span><strong>{snapshot.summary.alerts}</strong><small>needs review</small></div>
+        <div className="metric-card"><span>Events</span><strong>{snapshot.summary.event_count}</strong><small>in this capture</small></div>
       </section>
 
-      <section className="content-grid">
+      <nav className="workspace-tabs" role="tablist" aria-label="Capture views">
+        {workspaceTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={activeView === tab.id}
+            className={`workspace-tab ${activeView === tab.id ? "active" : ""}`}
+            onClick={() => setActiveView(tab.id)}
+          >
+            <strong>{tab.label}</strong>
+            <span>{tab.hint}</span>
+          </button>
+        ))}
+      </nav>
+
+      {refreshError && <p className="refresh-error workspace-error">{refreshError}</p>}
+      {captureError && <p className="refresh-error capture-error workspace-error">{captureError}</p>}
+
+      {activeView === "processes" && <section className="content-grid">
         <div className="panel process-panel">
           <div className="panel-heading">
             <div>
@@ -900,30 +1401,42 @@ function App() {
             </button>
           </div>
           {observationError && <p className="error-note">Observation change failed: {observationError}</p>}
-          <div className="table-wrap process-table-wrap">
-            <table>
+          <div ref={processTableRef} className="table-wrap process-table-wrap">
+            <table
+              className="resizable-table"
+              style={{ width: `${processTableWidth}px`, minWidth: "100%" }}
+            >
+              <colgroup>
+                <col style={{ width: `${processColumnWidths.name}px` }} />
+                <col style={{ width: `${processColumnWidths.pid}px` }} />
+                <col style={{ width: `${processColumnWidths.connections}px` }} />
+                <col style={{ width: `${processColumnWidths.traffic}px` }} />
+                <col style={{ width: `${processColumnWidths.level}px` }} />
+                <col style={{ width: `${processColumnWidths.inspect}px` }} />
+              </colgroup>
               <thead>
                 <tr>
-                  <SortableHeader label="Process" column="name" sort={processSort} onSort={changeProcessSort} />
-                  <SortableHeader label="PID" column="pid" sort={processSort} onSort={changeProcessSort} />
-                  <SortableHeader label="Connections" column="connections" sort={processSort} onSort={changeProcessSort} />
-                  <SortableHeader label="Traffic" column="traffic" sort={processSort} onSort={changeProcessSort} />
-                  <SortableHeader label="Level" column="level" sort={processSort} onSort={changeProcessSort} />
-                  <SortableHeader label="Risk" column="risk" sort={processSort} onSort={changeProcessSort} />
-                  <th scope="col">Inspect</th>
+                  <SortableHeader label="Process" column="name" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.name} onResizeStart={(clientX) => beginProcessColumnResize("name", clientX)} />
+                  <SortableHeader label="PID" column="pid" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.pid} onResizeStart={(clientX) => beginProcessColumnResize("pid", clientX)} />
+                  <SortableHeader label="Connections" column="connections" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.connections} onResizeStart={(clientX) => beginProcessColumnResize("connections", clientX)} />
+                  <SortableHeader label="Traffic" column="traffic" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.traffic} onResizeStart={(clientX) => beginProcessColumnResize("traffic", clientX)} />
+                  <SortableHeader label="Level" column="level" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.level} onResizeStart={(clientX) => beginProcessColumnResize("level", clientX)} />
+                  <th scope="col" style={{ width: `${processColumnWidths.inspect}px` }}>
+                    <span>Inspect</span>
+                    <ColumnResizer label="Inspect" onResizeStart={(clientX) => beginProcessColumnResize("inspect", clientX)} />
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 {sortedProcesses.length === 0 ? (
-                  <tr><td colSpan={7} className="muted empty-cell">No processes observed yet.</td></tr>
+                  <tr><td colSpan={6} className="muted empty-cell">No processes observed yet.</td></tr>
                 ) : pagedProcesses.map((process) => (
-                  <tr key={process.pid}>
+                  <tr key={process.pid} data-scroll-key={`process:${process.pid}`}>
                     <td><span className="process-name">{process.name}</span></td>
                     <td className="muted">{process.pid}</td>
                     <td>{process.connections}</td>
                     <td>{formatBytes(process.sent_bytes + process.received_bytes)}</td>
                     <td><span className={`level level-${process.level.toLowerCase()}`}>{process.level}</span></td>
-                    <td><span className="risk-score">{process.risk_score ? Math.round(process.risk_score) : "—"}</span></td>
                     <td>
                       <select
                         className="observation-select"
@@ -935,7 +1448,7 @@ function App() {
                         <option value="L1">L1 · metadata</option>
                         <option value="L2">L2 · reserved</option>
                         <option value="L3">L3 · TLS metadata</option>
-                        <option value="L4">L4 · HTTP metadata</option>
+                        <option value="L4">L4 · HTTP + small text</option>
                         <option value="L5">L5 · plaintext</option>
                       </select>
                     </td>
@@ -954,98 +1467,9 @@ function App() {
           />
         </div>
 
-        <div className="panel focus-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">FOCUS QUEUE</p>
-              <h2>Needs attention</h2>
-            </div>
-            <span className="risk-pill">{snapshot.summary.alerts} signal{snapshot.summary.alerts === 1 ? "" : "s"}</span>
-          </div>
-          <div className="focus-content">
-            <div className="focus-item">
-              <div className="focus-icon">↗</div>
-              <div>
-                <strong>{latestAlert?.summary ?? (isLive ? "No active signals" : "Waiting for Core")}</strong>
-                <p>{latestAlert ? `${latestAlert.rule} · risk ${Math.round(latestAlert.risk_score)}${latestAlert.domain ? ` · ${latestAlert.domain}` : ""}` : "Detection rules will appear here as the event pipeline observes traffic."}</p>
-              </div>
-              <button
-                className="inspect-button"
-                disabled={!latestAlert?.connection_id}
-                onClick={() => latestAlert?.connection_id && focusConnection(latestAlert.connection_id)}
-              >Inspect signal</button>
-            </div>
-            <div className="empty-note">
-              <span>⌁</span>
-              <p>Deep inspection is on-demand.<br />L4 keeps HTTP metadata only; L5 plaintext is capped at 512 B/event.</p>
-            </div>
-          </div>
-        </div>
-      </section>
+      </section>}
 
-      {refreshError && <p className="refresh-error">{refreshError}</p>}
-
-      <section className="insight-grid">
-        <div className="panel alert-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">DETECTION</p>
-              <h2>Signals</h2>
-            </div>
-            <span className="connection-count">{snapshot.alerts.length} in memory</span>
-          </div>
-          <div className="alert-list">
-            {snapshot.alerts.length === 0 ? (
-              <div className="graph-empty alert-empty"><span>✓</span><p>No rule matched in the current runtime window.</p></div>
-            ) : snapshot.alerts.slice(0, 6).map((alert) => (
-              <button
-                className="alert-row"
-                key={alert.id}
-                onClick={() => {
-                  if (alert.connection_id) {
-                    focusConnection(alert.connection_id);
-                  } else if (alert.process_id) {
-                    const pid = String(alert.process_id);
-                    setTimelinePidInput(pid);
-                    setTimelinePid(pid);
-                    setTimelineOffset(0);
-                  }
-                }}
-              >
-                <span className={`severity severity-${alert.severity}`}>{alert.severity}</span>
-                <span className="alert-row-body">
-                  <strong>{alert.summary}</strong>
-                  <small>{alert.rule} · risk {Math.round(alert.risk_score)}{alert.process_name ? ` · ${alert.process_name}` : ""}</small>
-                </span>
-                <span className="alert-row-arrow">›</span>
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="panel graph-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">PHASE 12</p>
-              <h2>Behavior graph</h2>
-            </div>
-            <span className="connection-count">{snapshot.graph.nodes.length} nodes · {snapshot.graph.edges.length} links</span>
-          </div>
-          <BehaviorGraphView
-            graph={snapshot.graph}
-            onNodeClick={(node) => {
-              if (node.connection_id) {
-                focusConnection(node.connection_id);
-              } else if (node.pid) {
-                setTimelinePidInput(String(node.pid));
-                setTimelinePid(String(node.pid));
-                setTimelineOffset(0);
-              }
-            }}
-          />
-        </div>
-      </section>
-
-      <section className="panel connection-panel">
+      {activeView === "connections" && <section className="panel connection-panel">
         <div className="panel-heading">
           <div>
             <p className="eyebrow">{isLive ? "KERNEL EVENTS" : "DEMO EVENTS"}</p>
@@ -1069,28 +1493,43 @@ function App() {
             </span>
           </div>
         </div>
-        <div className="table-wrap connection-table-wrap">
-          <table>
+        <div ref={connectionTableRef} className="table-wrap connection-table-wrap">
+          <table
+            className="resizable-table"
+            style={{ width: `${connectionTableWidth}px`, minWidth: "100%" }}
+          >
+            <colgroup>
+              <col style={{ width: `${connectionColumnWidths.process}px` }} />
+              <col style={{ width: `${connectionColumnWidths.pid}px` }} />
+              <col style={{ width: `${connectionColumnWidths.remote}px` }} />
+              <col style={{ width: `${connectionColumnWidths.domain}px` }} />
+              <col style={{ width: `${connectionColumnWidths.state}px` }} />
+              <col style={{ width: `${connectionColumnWidths.traffic}px` }} />
+              <col style={{ width: `${connectionColumnWidths.last_seen}px` }} />
+              <col style={{ width: `${connectionColumnWidths.trace}px` }} />
+            </colgroup>
             <thead>
               <tr>
-                <SortableHeader label="Process" column="process" sort={connectionSort} onSort={changeConnectionSort} />
-                <SortableHeader label="PID" column="pid" sort={connectionSort} onSort={changeConnectionSort} />
-                <SortableHeader label="Remote" column="remote" sort={connectionSort} onSort={changeConnectionSort} />
-                <SortableHeader label="Domain" column="domain" sort={connectionSort} onSort={changeConnectionSort} />
-                <SortableHeader label="State" column="state" sort={connectionSort} onSort={changeConnectionSort} />
-                <SortableHeader label="Traffic" column="traffic" sort={connectionSort} onSort={changeConnectionSort} />
-                <SortableHeader label="Updated" column="last_seen" sort={connectionSort} onSort={changeConnectionSort} />
-                <SortableHeader label="Risk" column="risk" sort={connectionSort} onSort={changeConnectionSort} />
-                <th scope="col">Trace</th>
+                <SortableHeader label="Process" column="process" sort={connectionSort} onSort={changeConnectionSort} width={connectionColumnWidths.process} onResizeStart={(clientX) => beginConnectionColumnResize("process", clientX)} />
+                <SortableHeader label="PID" column="pid" sort={connectionSort} onSort={changeConnectionSort} width={connectionColumnWidths.pid} onResizeStart={(clientX) => beginConnectionColumnResize("pid", clientX)} />
+                <SortableHeader label="Remote" column="remote" sort={connectionSort} onSort={changeConnectionSort} width={connectionColumnWidths.remote} onResizeStart={(clientX) => beginConnectionColumnResize("remote", clientX)} />
+                <SortableHeader label="Domain" column="domain" sort={connectionSort} onSort={changeConnectionSort} width={connectionColumnWidths.domain} onResizeStart={(clientX) => beginConnectionColumnResize("domain", clientX)} />
+                <SortableHeader label="State" column="state" sort={connectionSort} onSort={changeConnectionSort} width={connectionColumnWidths.state} onResizeStart={(clientX) => beginConnectionColumnResize("state", clientX)} />
+                <SortableHeader label="Traffic" column="traffic" sort={connectionSort} onSort={changeConnectionSort} width={connectionColumnWidths.traffic} onResizeStart={(clientX) => beginConnectionColumnResize("traffic", clientX)} />
+                <SortableHeader label="Updated" column="last_seen" sort={connectionSort} onSort={changeConnectionSort} width={connectionColumnWidths.last_seen} onResizeStart={(clientX) => beginConnectionColumnResize("last_seen", clientX)} />
+                <th scope="col" style={{ width: `${connectionColumnWidths.trace}px` }}>
+                  <span>Trace</span>
+                  <ColumnResizer label="Trace" onResizeStart={(clientX) => beginConnectionColumnResize("trace", clientX)} />
+                </th>
               </tr>
             </thead>
             <tbody>
               {visibleConnections.length === 0 ? (
-                <tr><td colSpan={9} className="muted empty-cell">
+                <tr><td colSpan={8} className="muted empty-cell">
                   {showClosedConnections ? "No connections observed yet." : "No active connections. Enable Show closed to inspect history."}
                 </td></tr>
               ) : pagedConnections.map((connection) => (
-                <tr key={connection.id}>
+                <tr key={connection.id} data-scroll-key={`connection:${connection.id}`}>
                   <td><span className="process-name">{connection.process_name ?? (connection.pid ? processNames.get(connection.pid) ?? `exited (${connection.pid})` : "unknown")}</span></td>
                   <td className="muted">{connection.pid ?? "—"}</td>
                   <td>{connection.remote.address}:{connection.remote.port}</td>
@@ -1098,7 +1537,6 @@ function App() {
                   <td><span className={`state state-${connection.state}`}>{stateLabel(connection.tcp_state ?? connection.state)}</span></td>
                   <td>{formatBytes(connection.sent_bytes + connection.received_bytes)}</td>
                   <td className="muted">{formatClock(connection.last_seen_ns ?? connection.first_seen_ns)}</td>
-                  <td><span className="risk-score">{connection.risk_score ? Math.round(connection.risk_score) : "—"}</span></td>
                   <td>
                     <button
                       className="trace-button"
@@ -1121,9 +1559,9 @@ function App() {
           loading={false}
           onPageChange={setConnectionPageIndex}
         />
-      </section>
+      </section>}
 
-      <section className="panel connection-timeline-panel">
+      {activeView === "sessions" && <section className="panel connection-timeline-panel">
         <div className="panel-heading connection-timeline-heading">
           <div>
             <p className="eyebrow">CONNECTION ACTIVITY</p>
@@ -1133,14 +1571,42 @@ function App() {
             {showClosedConnections ? `${snapshot.connection_timeline.total} observed` : `${snapshot.connection_timeline.total} active`}
           </span>
         </div>
-        <div className="session-list">
+        <div ref={sessionListRef} className="session-list">
+          <div className="session-list-header" style={{ gridTemplateColumns: sessionGridTemplate }} role="row">
+            <div className="session-header-cell">
+              <span>Connection</span>
+              <ColumnResizer label="Connection" onResizeStart={(clientX) => beginSessionColumnResize("route", clientX)} />
+            </div>
+            <div className="session-header-cell">
+              <span>State</span>
+              <ColumnResizer label="State" onResizeStart={(clientX) => beginSessionColumnResize("state", clientX)} />
+            </div>
+            <div className="session-header-cell">
+              <span>Details</span>
+              <ColumnResizer label="Details" onResizeStart={(clientX) => beginSessionColumnResize("details", clientX)} />
+            </div>
+            <div className="session-header-cell">
+              <span>Session ID</span>
+              <ColumnResizer label="Session ID" onResizeStart={(clientX) => beginSessionColumnResize("id", clientX)} />
+            </div>
+            <div className="session-header-cell">
+              <span>Inspect</span>
+              <ColumnResizer label="Inspect" onResizeStart={(clientX) => beginSessionColumnResize("inspect", clientX)} />
+            </div>
+          </div>
           {visibleConnectionSessions.length === 0 ? (
             <p className="muted empty-cell">No connection sessions observed yet.</p>
           ) : visibleConnectionSessions.map((session) => {
             const processLabel = session.process_name ?? (session.pid ? `exited (${session.pid})` : "unknown process");
             const remoteLabel = `${session.domain ?? session.remote.address}:${session.remote.port}`;
             return (
-              <article className="connection-session" id={`connection-session-${encodeURIComponent(session.id)}`} key={session.id}>
+              <article
+                className="connection-session"
+                style={{ gridTemplateColumns: sessionGridTemplate }}
+                id={`connection-session-${encodeURIComponent(session.id)}`}
+                data-scroll-key={`session:${session.id}`}
+                key={session.id}
+              >
                 <div className="session-heading">
                   <div className="session-route">
                     <span className="process-name">{processLabel}</span>
@@ -1161,15 +1627,15 @@ function App() {
                       TLS {session.tls_sni ?? "—"}{session.tls_version ? ` · ${session.tls_version}` : ""}
                     </span>
                   )}
-                  <button
-                    className="trace-button"
-                    title={session.id}
-                    onClick={() => toggleConnectionSession(session)}
-                  >
-                    Open details
-                  </button>
                 </div>
                 <div className="session-id">{session.id} · started {formatTimestamp(session.first_seen_ns, session.first_seen_ns)}</div>
+                <button
+                  className="trace-button"
+                  title={session.id}
+                  onClick={() => toggleConnectionSession(session)}
+                >
+                  Open details
+                </button>
               </article>
             );
           })}
@@ -1182,7 +1648,7 @@ function App() {
             loading={false}
           onPageChange={(page) => setConnectionTimelineOffset(page * connectionTimelinePageSize)}
         />
-      </section>
+      </section>}
 
       {selectedConnection && (
         <div
@@ -1218,7 +1684,7 @@ function App() {
               <div className="modal-actions">
                 <button
                   className="ghost-button"
-                  onClick={() => void loadConnectionEvents(selectedConnection.id)}
+                  onClick={() => void loadConnectionEvents(selectedConnection.id, showPlaintextFragments)}
                   disabled={connectionEventsLoadingId === selectedConnection.id || snapshot.mode !== "live"}
                 >
                   {connectionEventsLoadingId === selectedConnection.id ? "Loading" : "Refresh details"}
@@ -1253,15 +1719,29 @@ function App() {
                   <p className="muted session-events-note">Showing the latest {selectedConnection.events.length} of {selectedConnection.event_count} events.</p>
                 )}
                 {selectedConnection.events.map((event) => (
-                  <div className="session-event" key={event.id}>
+                  <div
+                    className={`session-event ${canInspectPayload(event) ? "payload-event" : ""}`}
+                    key={event.id}
+                    onClick={() => canInspectPayload(event) && setSelectedPayloadEntry(event)}
+                    onKeyDown={(keyboardEvent) => {
+                      if (canInspectPayload(event) && (keyboardEvent.key === "Enter" || keyboardEvent.key === " ")) {
+                        keyboardEvent.preventDefault();
+                        setSelectedPayloadEntry(event);
+                      }
+                    }}
+                    role={canInspectPayload(event) ? "button" : undefined}
+                    tabIndex={canInspectPayload(event) ? 0 : undefined}
+                  >
                     <time>{formatTimestamp(event.timestamp_ns, selectedConnection.first_seen_ns)}</time>
                     <span className={`timeline-marker timeline-marker-${event.kind}`} />
                     <div>
                       <div className="timeline-meta">
                         <span className="timeline-kind">{timelineKindLabel(event.kind)}</span>
+                        {canInspectPayload(event) && <span className="payload-hint">click to inspect</span>}
                       </div>
-                  <strong>{event.summary}</strong>
+                      <strong>{event.summary}</strong>
                       <p>{timelineDetail(event)}</p>
+                      {timelineBody(event) && <pre className="timeline-payload">{timelineBody(event)}</pre>}
                     </div>
                   </div>
                 ))}
@@ -1271,7 +1751,70 @@ function App() {
         </div>
       )}
 
-      <section className="panel timeline-panel">
+      {selectedPayloadEntry && (
+        <div
+          className="modal-backdrop payload-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setSelectedPayloadEntry(null);
+          }}
+        >
+          <section
+            className="payload-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="payload-modal-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow">PAYLOAD INSPECTOR</p>
+                <h2 id="payload-modal-title">{payloadTitle(selectedPayloadEntry)}</h2>
+                <p className="modal-subtitle">
+                  {selectedPayloadEntry.process_name ?? "unknown process"}
+                  {selectedPayloadEntry.pid !== null && ` · PID ${selectedPayloadEntry.pid}`}
+                  {selectedPayloadEntry.connection_id && ` · ${selectedPayloadEntry.connection_id}`}
+                </p>
+              </div>
+              <button
+                className="modal-close"
+                aria-label="Close payload inspector"
+                onClick={() => setSelectedPayloadEntry(null)}
+              >
+                ×
+              </button>
+            </div>
+            <div className="modal-meta">
+              <span>{selectedPayloadEntry.http_direction ? `HTTP ${stateLabel(selectedPayloadEntry.http_direction)}` : stateLabel(selectedPayloadEntry.plaintext_direction ?? "plaintext")}</span>
+              {selectedPayloadEntry.http_host && <span>Host {selectedPayloadEntry.http_host}</span>}
+              {selectedPayloadEntry.http_headers?.length ? <span>{selectedPayloadEntry.http_headers.length} headers</span> : null}
+              {payloadBytes(selectedPayloadEntry) !== null && <span>{formatBytes(payloadBytes(selectedPayloadEntry) ?? 0)} captured</span>}
+              {selectedPayloadEntry.http_body_truncated || selectedPayloadEntry.plaintext_truncated ? <span className="payload-warning">preview truncated</span> : null}
+            </div>
+            {selectedPayloadEntry.http_headers?.length ? (
+              <details className="payload-headers">
+                <summary>Show HTTP headers</summary>
+                <pre>{selectedPayloadEntry.http_headers.map((header) => `${header.name}: ${header.value}`).join("\n")}</pre>
+              </details>
+            ) : null}
+            {selectedPayloadEntry.http_payload_skipped || selectedPayloadEntry.plaintext_skipped ? (
+              <div className="payload-skipped">
+                <strong>内容未采集</strong>
+                <p>
+                  {stateLabel(selectedPayloadEntry.http_payload_skip_reason ?? selectedPayloadEntry.plaintext_skip_reason ?? "unsupported")}
+                  。只保留了元数据和字节数，避免把二进制或大文件塞进内存。
+                </p>
+              </div>
+            ) : payloadContent(selectedPayloadEntry) ? (
+              <pre className="payload-view">{payloadContent(selectedPayloadEntry)}</pre>
+            ) : (
+              <p className="muted payload-empty">没有可显示的文本 body；如果这是 HTTP 事件，可以展开上面的 headers 查看请求/响应头。</p>
+            )}
+          </section>
+        </div>
+      )}
+
+      {activeView === "timeline" && <section className="panel timeline-panel">
         <div className="panel-heading timeline-heading">
           <div>
             <p className="eyebrow">ADVANCED VIEW</p>
@@ -1329,16 +1872,41 @@ function App() {
                 }}
               />
             </label>
+            <label className="timeline-toggle">
+              <input
+                type="checkbox"
+                checked={showPlaintextFragments}
+                onChange={(event) => {
+                  setShowPlaintextFragments(event.target.checked);
+                  setTimelineOffset(0);
+                  setConnectionTimelineOffset(0);
+                }}
+              />
+              show SSL fragments
+            </label>
             <button className="ghost-button" onClick={applyTimelineFilters} disabled={refreshing}>Apply</button>
             <button className="ghost-button" onClick={resetTimelineFilters} disabled={refreshing}>Reset</button>
           </div>
           <span className="connection-count">{snapshot.timeline.total} matching events</span>
         </div>
-        <div className="timeline-list">
+        <div ref={timelineListRef} className="timeline-list">
           {snapshot.timeline.entries.length === 0 ? (
             <p className="muted empty-cell">No timeline events observed yet.</p>
           ) : snapshot.timeline.entries.slice().reverse().map((entry) => (
-            <article className="timeline-item" key={entry.id}>
+            <article
+              className={`timeline-item ${canInspectPayload(entry) ? "payload-event" : ""}`}
+              key={entry.id}
+              data-scroll-key={`timeline:${entry.id}`}
+              onClick={() => canInspectPayload(entry) && setSelectedPayloadEntry(entry)}
+              onKeyDown={(keyboardEvent) => {
+                if (canInspectPayload(entry) && (keyboardEvent.key === "Enter" || keyboardEvent.key === " ")) {
+                  keyboardEvent.preventDefault();
+                  setSelectedPayloadEntry(entry);
+                }
+              }}
+              role={canInspectPayload(entry) ? "button" : undefined}
+              tabIndex={canInspectPayload(entry) ? 0 : undefined}
+            >
               <time className="timeline-time">
                 {formatTimestamp(entry.timestamp_ns, snapshot.timeline.entries[0]?.timestamp_ns ?? entry.timestamp_ns)}
               </time>
@@ -1348,9 +1916,11 @@ function App() {
                   <span className="timeline-kind">{timelineKindLabel(entry.kind)}</span>
                   {entry.process_name && <span className="muted">{entry.process_name}</span>}
                   {entry.pid !== null && <span className="muted">PID {entry.pid}</span>}
+                  {canInspectPayload(entry) && <span className="payload-hint">click to inspect</span>}
                 </div>
                 <strong>{entry.summary}</strong>
                 <p>{timelineDetail(entry)}</p>
+                {timelineBody(entry) && <pre className="timeline-payload">{timelineBody(entry)}</pre>}
               </div>
             </article>
           ))}
@@ -1363,7 +1933,7 @@ function App() {
           loading={false}
           onPageChange={(page) => setTimelineOffset(page * Math.max(1, snapshot.timeline.limit))}
         />
-      </section>
+      </section>}
     </main>
   );
 }

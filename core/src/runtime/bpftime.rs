@@ -260,7 +260,7 @@ impl BpftimeRuntime {
         if !self.is_available() {
             return Err(self.detail.clone());
         }
-        let target_info = resolve_user_target(pid)?;
+        let target_info = resolve_user_ssl_target(pid)?;
         let object_path = resolve_object_path(object_dir, spec.object_file)?;
         let key = attachment_key(target, pid, probe, spec.function_name);
         if self.managed.iter().any(|attachment| attachment.key == key) {
@@ -399,7 +399,7 @@ pub fn resolve_user_target(pid: u32) -> Result<UserTarget, String> {
     }
     let executable = fs::canonicalize(process_dir.join("exe"))
         .map_err(|error| format!("cannot resolve /proc/{pid}/exe: {error}"))?;
-    let library = find_ssl_library(pid).unwrap_or_else(|| executable.clone());
+    let library = find_mapped_ssl_library(pid).unwrap_or_else(|| executable.clone());
     Ok(UserTarget {
         pid,
         executable,
@@ -407,26 +407,74 @@ pub fn resolve_user_target(pid: u32) -> Result<UserTarget, String> {
     })
 }
 
-fn find_ssl_library(pid: u32) -> Option<PathBuf> {
+/// Resolve a target only when the dynamic OpenSSL library is mapped. Uprobes
+/// attached to the executable as a fallback can look successful while never
+/// seeing SSL_* calls, so real probe attachment must wait for libssl.
+pub fn resolve_user_ssl_target(pid: u32) -> Result<UserTarget, String> {
+    if pid == 0 {
+        return resolve_global_ssl_target();
+    }
+    let mut target = resolve_user_target(pid)?;
+    target.library = find_mapped_ssl_library(pid).ok_or_else(|| {
+        format!("libssl is not mapped in process {pid} yet; userspace probes will be retried")
+    })?;
+    Ok(target)
+}
+
+/// Resolve a system-wide libssl path for a uprobe attached to all processes.
+/// This is used by process-name selectors so a newly exec'd short-lived
+/// client is covered before its ProcessExec event reaches Core.
+pub fn resolve_global_ssl_target() -> Result<UserTarget, String> {
+    let library = find_global_ssl_library().ok_or_else(|| {
+        "no mapped or installed libssl library could be found for global userspace probes"
+            .to_owned()
+    })?;
+    Ok(UserTarget {
+        pid: 0,
+        executable: library.clone(),
+        library,
+    })
+}
+
+fn find_mapped_ssl_library(pid: u32) -> Option<PathBuf> {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
     let paths = maps.lines().filter_map(map_path).collect::<Vec<_>>();
-    paths
-        .iter()
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("libssl"))
-                && path.is_file()
-        })
-        .cloned()
-        .or_else(|| {
-            paths.into_iter().find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains("libcrypto"))
-                    && path.is_file()
-            })
-        })
+    paths.into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("libssl"))
+            && path.is_file()
+    })
+}
+
+fn find_global_ssl_library() -> Option<PathBuf> {
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.filter_map(Result::ok) {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some(library) = find_mapped_ssl_library(pid) {
+                return Some(library);
+            }
+        }
+    }
+
+    let candidates = [
+        "/lib/x86_64-linux-gnu/libssl.so.3",
+        "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+        "/lib/aarch64-linux-gnu/libssl.so.3",
+        "/usr/lib/aarch64-linux-gnu/libssl.so.3",
+        "/lib64/libssl.so.3",
+        "/usr/lib64/libssl.so.3",
+    ];
+    candidates
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
 }
 
 fn map_path(line: &str) -> Option<PathBuf> {

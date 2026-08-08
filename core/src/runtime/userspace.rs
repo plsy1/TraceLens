@@ -14,7 +14,10 @@ use tracelens_events::{
 use crate::observation::ObservationLevel;
 
 use super::{
-    bpftime::{probe_specs, resolve_user_target, BpftimeAttachment, BpftimeRuntime, ProbeSpec},
+    bpftime::{
+        probe_specs, resolve_global_ssl_target, resolve_user_ssl_target, BpftimeAttachment,
+        BpftimeRuntime, ProbeSpec,
+    },
     probes_for_level, ProbeKind, RuntimeStatus, UserspaceRuntime,
 };
 
@@ -66,7 +69,6 @@ impl KernelUprobeRuntime {
             });
         }
 
-        let target_info = resolve_user_target(pid)?;
         if self.dry_run {
             self.attachments.insert(
                 key,
@@ -89,6 +91,13 @@ impl KernelUprobeRuntime {
                 runtime: UserspaceRuntime::KernelUprobe,
             });
         }
+
+        let target_info = if pid == 0 {
+            resolve_global_ssl_target()?
+        } else {
+            resolve_user_ssl_target(pid)?
+        };
+        let attach_pid = if pid == 0 { -1 } else { pid as i32 };
 
         let object_path = object_dir.join(spec.object_file);
         if !object_path.is_file() {
@@ -117,7 +126,7 @@ impl KernelUprobeRuntime {
                     })?;
                 program
                     .attach_uprobe_with_opts(
-                        pid as i32,
+                        attach_pid,
                         &target_info.library,
                         0,
                         UprobeOpts {
@@ -128,10 +137,14 @@ impl KernelUprobeRuntime {
                     )
                     .map_err(|error| {
                         format!(
-                            "failed to attach {} to {} for pid {}: {error}",
+                            "failed to attach {} to {} for {}: {error}",
                             spec.function_name,
                             target_info.library.display(),
-                            pid
+                            if pid == 0 {
+                                "all processes".to_owned()
+                            } else {
+                                format!("pid {pid}")
+                            }
                         )
                     })
             };
@@ -302,6 +315,13 @@ impl ProbeRuntime {
         process_pids: &[u32],
     ) -> Vec<ProbeAttachment> {
         let mut attachments = Vec::new();
+        let process_pids = if target == "global" || target.starts_with("process-name:") {
+            // PID 0 is the internal sentinel for a uprobe attached to all
+            // processes. The Core scope filter drops unrelated events.
+            vec![0]
+        } else {
+            process_pids.to_vec()
+        };
         for probe in probes_for_level(level) {
             let specs = probe_specs(probe);
             if specs.is_empty() {
@@ -324,6 +344,20 @@ impl ProbeRuntime {
     pub fn detach_target(&mut self, target: &str) {
         self.bpftime.detach_target(target);
         self.kernel_uprobe.detach_target(target);
+    }
+
+    /// Detach every userspace probe managed by this runtime. Capture lifecycle
+    /// commands use this to make a stopped or reset capture release hooks
+    /// immediately instead of waiting for the traced processes to exit.
+    pub fn detach_all(&mut self) {
+        let targets = self
+            .attachments()
+            .into_iter()
+            .map(|attachment| attachment.target)
+            .collect::<std::collections::BTreeSet<_>>();
+        for target in targets {
+            self.detach_target(&target);
+        }
     }
 
     pub fn attachments(&self) -> Vec<ProbeAttachment> {
@@ -350,6 +384,28 @@ impl ProbeRuntime {
         attachments
     }
 
+    /// Return whether the managed links for a target exactly cover the
+    /// probes required by an observation level. A process can emit its exec
+    /// event before its dynamic SSL library is mapped, so an initial attach
+    /// may be incomplete and needs a later retry.
+    pub fn matches_level(&self, target: &str, level: ObservationLevel) -> bool {
+        let expected = probes_for_level(level)
+            .into_iter()
+            .flat_map(|probe| {
+                probe_specs(probe)
+                    .iter()
+                    .map(move |spec| (probe, spec.function_name.to_owned()))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual = self
+            .attachments()
+            .into_iter()
+            .filter(|attachment| attachment.target == target)
+            .map(|attachment| (attachment.probe, attachment.hook))
+            .collect::<std::collections::BTreeSet<_>>();
+        expected == actual
+    }
+
     fn attach(
         &mut self,
         target: &str,
@@ -357,7 +413,7 @@ impl ProbeRuntime {
         probe: ProbeKind,
         spec: ProbeSpec,
     ) -> Option<ProbeAttachment> {
-        if self.selected == UserspaceRuntime::Bpftime {
+        if self.selected == UserspaceRuntime::Bpftime && pid != 0 {
             match self
                 .bpftime
                 .attach(target, pid, probe, spec, &self.object_dir)
@@ -407,7 +463,7 @@ const EVENT_PLAINTEXT: u16 = 8;
 const EVENT_HTTP_CAPTURE: u16 = 11;
 const TLS_NAME_LEN: usize = 128;
 const TLS_VERSION_LEN: usize = 32;
-const PLAINTEXT_MAX_LEN: usize = 512;
+const PLAINTEXT_MAX_LEN: usize = 16 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -559,6 +615,8 @@ mod tests {
             .iter()
             .all(|attachment| attachment.runtime == UserspaceRuntime::KernelUprobe));
         assert_eq!(runtime.attachments().len(), 5);
+        assert!(runtime.matches_level(&target, ObservationLevel::L3));
+        assert!(!runtime.matches_level(&target, ObservationLevel::L5));
         runtime.detach_target(&target);
         assert!(runtime.attachments().is_empty());
     }
@@ -609,7 +667,10 @@ mod tests {
 
     #[test]
     fn decodes_bounded_plaintext_from_the_shared_ring_buffer_layout() {
-        assert_eq!(std::mem::size_of::<UserPlaintextEvent>(), 552);
+        assert_eq!(
+            std::mem::size_of::<UserPlaintextEvent>(),
+            40 + PLAINTEXT_MAX_LEN
+        );
         let event = UserPlaintextEvent {
             event_type: 8,
             direction: 2,
@@ -618,7 +679,7 @@ mod tests {
             ssl_object: 0x1234,
             fd: 9,
             payload_size: 900,
-            truncated: 1,
+            truncated: 0,
             payload: {
                 let mut value = [0_u8; PLAINTEXT_MAX_LEN];
                 value.fill(b'x');
@@ -644,10 +705,10 @@ mod tests {
                 ..
             } => {
                 assert!(data.starts_with("hello"));
-                assert_eq!(data.len(), PLAINTEXT_MAX_LEN);
+                assert_eq!(data.len(), 900);
                 assert_eq!(bytes, 900);
                 assert_eq!(direction, tracelens_events::PlaintextDirection::Write);
-                assert!(truncated);
+                assert!(!truncated);
             }
             payload => panic!("unexpected payload: {payload:?}"),
         }
@@ -686,7 +747,43 @@ mod tests {
     }
 
     #[test]
-    fn l4_attaches_http_capture_pairs_without_plaintext_probes() {
+    fn process_name_level_uses_global_probe_attachments() {
+        let status = RuntimeStatus {
+            kernel_observation: true,
+            userspace_runtime: UserspaceRuntime::KernelUprobe,
+            detail: "test fallback".to_owned(),
+        };
+        let mut runtime = ProbeRuntime::new_for_test(&status);
+        let attachments = runtime.set_level("process-name:curl", ObservationLevel::L4, &[]);
+        assert_eq!(attachments.len(), 7);
+        assert!(attachments.iter().all(|attachment| attachment.pid == 0));
+        assert!(attachments
+            .iter()
+            .all(|attachment| attachment.target == "process-name:curl"));
+        runtime.detach_target("process-name:curl");
+        assert!(runtime.attachments().is_empty());
+    }
+
+    #[test]
+    fn global_level_uses_global_probe_attachments() {
+        let status = RuntimeStatus {
+            kernel_observation: true,
+            userspace_runtime: UserspaceRuntime::KernelUprobe,
+            detail: "test fallback".to_owned(),
+        };
+        let mut runtime = ProbeRuntime::new_for_test(&status);
+        let attachments = runtime.set_level("global", ObservationLevel::L4, &[]);
+        assert_eq!(attachments.len(), 7);
+        assert!(attachments.iter().all(|attachment| attachment.pid == 0));
+        assert!(attachments
+            .iter()
+            .all(|attachment| attachment.target == "global"));
+        runtime.detach_target("global");
+        assert!(runtime.attachments().is_empty());
+    }
+
+    #[test]
+    fn l4_attaches_bounded_capture_pairs_without_http_probes() {
         let status = RuntimeStatus {
             kernel_observation: true,
             userspace_runtime: UserspaceRuntime::KernelUprobe,
@@ -699,10 +796,10 @@ mod tests {
         assert_eq!(attachments.len(), 7);
         assert!(attachments
             .iter()
-            .any(|attachment| attachment.probe == crate::runtime::ProbeKind::Http));
+            .any(|attachment| attachment.probe == crate::runtime::ProbeKind::Plaintext));
         assert!(!attachments
             .iter()
-            .any(|attachment| attachment.probe == crate::runtime::ProbeKind::Plaintext));
+            .any(|attachment| attachment.probe == crate::runtime::ProbeKind::Http));
         runtime.detach_target(&target);
     }
 

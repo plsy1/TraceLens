@@ -7,7 +7,7 @@ use tracelens_core::{
     config::{CoreConfig, StorageMode},
     events::{ConnectionTimelineFilter, TimelineFilter},
     observation::{ObservationLevel, ObservationTarget},
-    Core,
+    CaptureScope, CaptureState, Core,
 };
 use tracelens_events::{
     ConnectionRef, ConnectionState, Endpoint, EventKind, EventSource, FileEventData,
@@ -360,11 +360,24 @@ fn parses_http_messages_from_reassembled_plaintext() {
             ssl_object: 0x5678,
             fd: Some(fd as i32),
             direction: PlaintextDirection::Read,
-            data: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_owned(),
-            bytes: 47,
+            data: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no".to_owned(),
+            bytes: 46,
             truncated: false,
         },
         BASE_TIME_NS + 4,
+    ));
+    core.ingest_event(TraceEvent::http_capture(
+        EventSource::Kernel,
+        PID,
+        PlaintextEventData {
+            ssl_object: 0x5678,
+            fd: Some(fd as i32),
+            direction: PlaintextDirection::Read,
+            data: "k".to_owned(),
+            bytes: 1,
+            truncated: false,
+        },
+        BASE_TIME_NS + 5,
     ));
 
     let page = core.timeline_page(TimelineFilter {
@@ -378,11 +391,76 @@ fn parses_http_messages_from_reassembled_plaintext() {
     assert_eq!(page.entries[1].summary, "HTTP response 200 OK");
     assert_eq!(page.entries[1].http_status, Some(200));
     assert_eq!(page.entries[1].http_content_length, Some(2));
+    assert_eq!(page.entries[1].http_body_preview.as_deref(), Some("ok"));
+    assert_eq!(page.entries[1].http_body_bytes, 2);
     assert!(page
         .entries
         .iter()
         .all(|entry| entry.connection_id.as_deref() == Some(socket_id.as_str())));
     assert_eq!(core.http_stream_count(), 1);
+}
+
+#[test]
+fn skips_binary_plaintext_but_keeps_http_metadata_and_traffic_size() {
+    let mut core = Core::new(CoreConfig::default());
+    core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+
+    for (timestamp_ns, data, bytes) in [
+        (
+            BASE_TIME_NS + 1,
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\n\r\nPN",
+            68,
+        ),
+        (BASE_TIME_NS + 2, "G!", 2),
+    ] {
+        core.ingest_event(TraceEvent::plaintext(
+            EventSource::Kernel,
+            PID,
+            PlaintextEventData {
+                ssl_object: 0x9999,
+                fd: None,
+                direction: PlaintextDirection::Read,
+                data: data.to_owned(),
+                bytes,
+                truncated: false,
+            },
+            timestamp_ns,
+        ));
+    }
+
+    let plaintext = core.timeline_page(TimelineFilter {
+        kind: Some(EventKind::Plaintext),
+        ..TimelineFilter::default()
+    });
+    assert_eq!(plaintext.total, 2);
+    assert!(plaintext.entries.iter().all(|entry| {
+        entry.plaintext_skipped
+            && entry.plaintext.as_deref() == Some("")
+            && entry.plaintext_skip_reason.as_deref() == Some("binary_content")
+    }));
+
+    let http = core.timeline_page(TimelineFilter {
+        kind: Some(EventKind::Http),
+        ..TimelineFilter::default()
+    });
+    assert_eq!(http.total, 1);
+    assert!(http.entries[0].http_payload_skipped);
+    assert_eq!(http.entries[0].http_body_preview, None);
+    assert_eq!(http.entries[0].http_body_bytes, 4);
+    assert_eq!(
+        http.entries[0].http_payload_skip_reason.as_deref(),
+        Some("binary_content")
+    );
+
+    let calm_timeline = core.timeline_page(TimelineFilter {
+        include_plaintext: false,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(calm_timeline.total, 2);
+    assert!(calm_timeline
+        .entries
+        .iter()
+        .all(|entry| entry.kind != EventKind::Plaintext));
 }
 
 #[test]
@@ -682,6 +760,183 @@ fn exact_observation_level_can_be_lowered_again() {
         core.observations().current_level(&target),
         ObservationLevel::L1
     );
+}
+
+#[test]
+fn l3_does_not_derive_http_from_plaintext_events() {
+    let mut core = Core::new(CoreConfig::default());
+    core.enable_observer_capture_mode();
+    core.set_capture_scope(CaptureScope::Process(PID));
+    core.set_persistent_observation(ObservationTarget::Process(PID), ObservationLevel::L3);
+
+    let fd = 11_u32;
+    let socket_id = format!("socket-{}", (u64::from(PID) << 32) | u64::from(fd));
+    core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+    ingest_connection(
+        &mut core,
+        EventKind::TcpConnect,
+        connection(
+            &socket_id,
+            None,
+            ConnectionState::Established,
+            TcpState::Established,
+            0,
+            0,
+        ),
+        BASE_TIME_NS + 1,
+    );
+    core.ingest_event(TraceEvent::plaintext(
+        EventSource::Kernel,
+        PID,
+        PlaintextEventData {
+            ssl_object: 0x4321,
+            fd: Some(fd as i32),
+            direction: PlaintextDirection::Write,
+            data: "GET / HTTP/1.1\r\nHost: example.net\r\n\r\n".to_owned(),
+            bytes: 38,
+            truncated: false,
+        },
+        BASE_TIME_NS + 2,
+    ));
+
+    let http = core.timeline_page(TimelineFilter {
+        kind: Some(EventKind::Http),
+        ..TimelineFilter::default()
+    });
+    assert_eq!(http.total, 0);
+    assert_eq!(core.http_stream_count(), 0);
+}
+
+#[test]
+fn capture_is_idle_until_started_and_reset_discards_the_session() {
+    let mut core = Core::new(CoreConfig::default());
+    core.stop_capture();
+    core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+    assert_eq!(core.capture_state(), CaptureState::Stopped);
+    assert!(core.store().is_empty());
+
+    core.start_capture();
+    core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS + 1));
+    assert_eq!(core.store().len(), 1);
+
+    assert_eq!(
+        core.reset_capture().expect("reset capture"),
+        CaptureState::Capturing
+    );
+    assert!(core.store().is_empty());
+    core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS + 2));
+    assert_eq!(core.store().len(), 1);
+}
+
+#[test]
+fn capture_scope_limits_kernel_events_to_a_pid_or_process_name() {
+    let mut pid_core = Core::new(CoreConfig::default());
+    pid_core.stop_capture();
+    pid_core.set_capture_scope(CaptureScope::Process(PID));
+    pid_core.start_capture();
+    pid_core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+    pid_core.ingest_event(TraceEvent::process_event(
+        EventSource::Kernel,
+        EventKind::ProcessExec,
+        4343,
+        Some(1),
+        "python3",
+        "python3 worker.py",
+        BASE_TIME_NS + 1,
+    ));
+    assert_eq!(pid_core.store().len(), 1);
+    assert_eq!(pid_core.timeline(10)[0].pid, Some(PID));
+
+    let mut name_core = Core::new(CoreConfig::default());
+    name_core.stop_capture();
+    name_core.set_capture_scope(CaptureScope::ProcessName("curl".to_owned()));
+    name_core.start_capture();
+    name_core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+    name_core.ingest_event(TraceEvent::process_event(
+        EventSource::Kernel,
+        EventKind::ProcessExec,
+        4343,
+        Some(1),
+        "python3",
+        "python3 worker.py",
+        BASE_TIME_NS + 1,
+    ));
+    name_core.ingest_event(TraceEvent::dns_event(
+        EventSource::Kernel,
+        EventKind::DnsResponse,
+        PID,
+        "example.net",
+        vec![FAKE_IP.to_owned()],
+        60,
+        BASE_TIME_NS + 2,
+    ));
+    name_core.ingest_event(TraceEvent::dns_event(
+        EventSource::Kernel,
+        EventKind::DnsResponse,
+        4343,
+        "worker.example.net",
+        vec!["198.51.100.9".to_owned()],
+        60,
+        BASE_TIME_NS + 3,
+    ));
+    let entries = name_core.timeline(10);
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| entry.pid == Some(PID)));
+}
+
+#[test]
+fn serves_capture_start_and_reset_commands_through_the_api() {
+    let core = Arc::new(Mutex::new(Core::new(CoreConfig::default())));
+    core.lock().expect("core lock").stop_capture();
+
+    let request = |method: &str, path: &str, body: &str| {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture API listener");
+        let address = listener.local_addr().expect("read capture API address");
+        let server_core = Arc::clone(&core);
+        let server = std::thread::spawn(move || server::serve_once(listener, server_core));
+        let mut client = TcpStream::connect(address).expect("connect capture API listener");
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        client
+            .write_all(request.as_bytes())
+            .expect("write capture API request");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read capture API response");
+        server
+            .join()
+            .expect("capture API server thread should finish")
+            .expect("capture API request should succeed");
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("capture API response body");
+        serde_json::from_str::<serde_json::Value>(body).expect("capture API JSON")
+    };
+
+    let started = request(
+        "POST",
+        "/api/capture/start",
+        r#"{"target":"process-name:curl","level":4}"#,
+    );
+    assert_eq!(started["state"], "capturing");
+    assert_eq!(
+        core.lock().expect("core lock").capture_scope(),
+        &CaptureScope::ProcessName("curl".to_owned())
+    );
+
+    core.lock()
+        .expect("core lock")
+        .ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+    assert_eq!(core.lock().expect("core lock").store().len(), 1);
+
+    let reset = request("POST", "/api/capture/reset", "");
+    assert_eq!(reset["state"], "capturing");
+    assert_eq!(reset["event_count"], 0);
+    assert!(core.lock().expect("core lock").store().is_empty());
 }
 
 #[test]

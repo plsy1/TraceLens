@@ -132,7 +132,7 @@ const EVENT_TLS_METADATA: u16 = 7;
 const EVENT_PLAINTEXT: u16 = 8;
 const TLS_NAME_LEN: usize = 128;
 const TLS_VERSION_LEN: usize = 32;
-const PLAINTEXT_MAX_LEN: usize = 512;
+const PLAINTEXT_MAX_LEN: usize = 16 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

@@ -12,7 +12,7 @@ use crate::detection::{Alert, AlertSeverity};
 use crate::events::{ConnectionTimelineFilter, TimelineFilter};
 use crate::graph::BehaviorGraph;
 use crate::observation::{ObservationLevel, ObservationTarget};
-use crate::Core;
+use crate::{CaptureScope, Core};
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -31,6 +31,22 @@ struct SummaryResponse {
     domains: usize,
     alerts: usize,
     observation_level: String,
+    capture_state: String,
+    capture_target: String,
+    event_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct CaptureResponse {
+    state: String,
+    event_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessCandidateResponse {
+    pid: u32,
+    name: String,
+    command_line: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +99,24 @@ struct ObservationCommand {
     duration_secs: Option<u64>,
     #[serde(default)]
     exact: bool,
+    #[serde(default)]
+    persistent: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultObservationCommand {
+    level: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct DefaultObservationResponse {
+    level: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CaptureStartCommand {
+    target: Option<String>,
+    level: Option<u8>,
 }
 
 pub fn serve(core: Arc<Mutex<Core>>, listen: SocketAddr) -> std::io::Result<()> {
@@ -129,6 +163,12 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
 
     if method == "OPTIONS" {
         return write_response(&mut stream, 204, "", "text/plain");
+    }
+    if method == "POST" && path.starts_with("/api/capture/") {
+        return handle_capture_command(&mut stream, core, path, body);
+    }
+    if method == "POST" && path == "/api/observations/default" {
+        return handle_default_observation_command(&mut stream, core, body);
     }
     if method == "POST" && path == "/api/observations" {
         return handle_observation_command(&mut stream, core, body);
@@ -189,7 +229,29 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                 domains,
                 alerts: core.alerts().len(),
                 observation_level: core.config().default_observation_level.to_string(),
+                capture_state: core.capture_state().to_string(),
+                capture_target: core.capture_scope().to_string(),
+                event_count: core.store().len(),
             })
+        }),
+        "/api/capture" => response_json(|| {
+            let core = core.lock().map_err(|_| "core lock poisoned")?;
+            Ok(CaptureResponse {
+                state: core.capture_state().to_string(),
+                event_count: core.store().len(),
+            })
+        }),
+        "/api/process-candidates" => response_json(|| {
+            let core = core.lock().map_err(|_| "core lock poisoned")?;
+            Ok(core
+                .available_processes()
+                .into_iter()
+                .map(|process| ProcessCandidateResponse {
+                    pid: process.pid,
+                    name: process.executable.unwrap_or_else(|| "unknown".to_owned()),
+                    command_line: process.command_line,
+                })
+                .collect::<Vec<_>>())
         }),
         "/api/processes" => response_json(|| {
             let core = core.lock().map_err(|_| "core lock poisoned")?;
@@ -226,10 +288,7 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                         connections,
                         sent_bytes,
                         received_bytes,
-                        level: core
-                            .observations()
-                            .current_level(&ObservationTarget::Process(pid))
-                            .to_string(),
+                        level: core.observation_level_for_process(pid).to_string(),
                         risk_score: core.risk_score_for_process(pid).0,
                     }
                 })
@@ -302,6 +361,12 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                 })
                 .collect::<Vec<_>>())
         }),
+        "/api/observations/default" => response_json(|| {
+            let core = core.lock().map_err(|_| "core lock poisoned")?;
+            Ok(DefaultObservationResponse {
+                level: core.config().default_observation_level.to_string(),
+            })
+        }),
         _ => {
             return write_response(
                 &mut stream,
@@ -323,11 +388,126 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
     }
 }
 
+fn handle_capture_command(
+    stream: &mut TcpStream,
+    core: &Arc<Mutex<Core>>,
+    path: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let action = path.strip_prefix("/api/capture/").unwrap_or_default();
+    let response = {
+        let mut core = match core.lock() {
+            Ok(core) => core,
+            Err(_) => return write_json_error(stream, 500, "core lock poisoned"),
+        };
+        if action == "start" && !body.trim().is_empty() {
+            let command: CaptureStartCommand = match serde_json::from_str(body) {
+                Ok(command) => command,
+                Err(error) => {
+                    return write_json_error(
+                        stream,
+                        400,
+                        &format!("invalid capture start command: {error}"),
+                    )
+                }
+            };
+            if let Some(raw_target) = command.target {
+                let scope = if raw_target == "global" {
+                    CaptureScope::Global
+                } else {
+                    match raw_target.parse::<ObservationTarget>() {
+                        Ok(ObservationTarget::Process(pid)) => CaptureScope::Process(pid),
+                        Ok(ObservationTarget::ProcessName(name)) => CaptureScope::ProcessName(name),
+                        Ok(_) => return write_json_error(
+                            stream,
+                            400,
+                            "capture target must be global, process:<pid>, or process-name:<name>",
+                        ),
+                        Err(error) => return write_json_error(stream, 400, &error),
+                    }
+                };
+                core.set_capture_scope(scope);
+            }
+            if let Some(raw_level) = command.level {
+                let Some(level) = ObservationLevel::from_number(raw_level) else {
+                    return write_json_error(
+                        stream,
+                        400,
+                        "observation level must be between 1 and 5",
+                    );
+                };
+                match core.capture_scope().clone() {
+                    CaptureScope::Global => {
+                        core.set_default_observation_level(level);
+                    }
+                    CaptureScope::Process(pid) => {
+                        core.set_persistent_observation(ObservationTarget::Process(pid), level);
+                    }
+                    CaptureScope::ProcessName(name) => {
+                        core.set_persistent_observation(
+                            ObservationTarget::ProcessName(name),
+                            level,
+                        );
+                    }
+                }
+            }
+        }
+        let state = match action {
+            "start" => Ok(core.start_capture()),
+            "stop" => Ok(core.stop_capture()),
+            "reset" => core.reset_capture(),
+            _ => return write_json_error(stream, 404, "unknown capture command"),
+        };
+        match state {
+            Ok(state) => CaptureResponse {
+                state: state.to_string(),
+                event_count: core.store().len(),
+            },
+            Err(error) => return write_json_error(stream, 500, &error),
+        }
+    };
+    let body = serde_json::to_string(&response)
+        .map_err(|error| io::Error::other(format!("encode capture response: {error}")))?;
+    write_response(stream, 200, &body, "application/json")
+}
+
+fn handle_default_observation_command(
+    stream: &mut TcpStream,
+    core: &Arc<Mutex<Core>>,
+    body: &str,
+) -> std::io::Result<()> {
+    let command: DefaultObservationCommand = match serde_json::from_str(body) {
+        Ok(command) => command,
+        Err(error) => {
+            return write_json_error(
+                stream,
+                400,
+                &format!("invalid default observation command: {error}"),
+            )
+        }
+    };
+    let Some(level) = ObservationLevel::from_number(command.level) else {
+        return write_json_error(stream, 400, "observation level must be between 1 and 5");
+    };
+    let level = match core.lock() {
+        Ok(mut core) => core.set_default_observation_level(level),
+        Err(_) => return write_json_error(stream, 500, "core lock poisoned"),
+    };
+    let body = serde_json::to_string(&DefaultObservationResponse {
+        level: level.to_string(),
+    })
+    .map_err(|error| io::Error::other(format!("encode observation response: {error}")))?;
+    write_response(stream, 200, &body, "application/json")
+}
+
 fn timeline_filter(query: &str) -> TimelineFilter {
     TimelineFilter {
         pid: query_parameter(query, "pid").and_then(|value| value.parse().ok()),
         kind: query_parameter(query, "kind").and_then(|value| parse_event_kind(&value)),
         connection_id: query_parameter(query, "connection_id"),
+        include_plaintext: query_parameter(query, "include_plaintext")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(true),
         offset: query_parameter(query, "offset")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
@@ -342,6 +522,9 @@ fn connection_timeline_filter(query: &str) -> ConnectionTimelineFilter {
     ConnectionTimelineFilter {
         pid: query_parameter(query, "pid").and_then(|value| value.parse().ok()),
         connection_id: query_parameter(query, "connection_id"),
+        include_plaintext: query_parameter(query, "include_plaintext")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(true),
         include_closed: query_parameter(query, "include_closed")
             .and_then(|value| value.parse().ok())
             .unwrap_or(true),
@@ -392,7 +575,11 @@ fn handle_observation_command(
         };
         let target_name = target.to_string();
         let applied_level = if command.exact {
-            core.set_observation(target.clone(), level, command.duration_secs)
+            if command.persistent {
+                core.set_persistent_observation(target.clone(), level)
+            } else {
+                core.set_observation(target.clone(), level, command.duration_secs)
+            }
         } else {
             core.upgrade_observation(target.clone(), level, command.duration_secs)
         };

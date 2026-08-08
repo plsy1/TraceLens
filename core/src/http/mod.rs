@@ -1,7 +1,11 @@
 pub mod parser;
+pub mod policy;
 pub mod stream;
 
 pub use parser::{HttpParseResult, MAX_HEADER_BYTES, MAX_MESSAGE_BYTES};
+pub use policy::{
+    capture_body, payload_decision, HttpBody, PayloadDecision, MAX_TEXT_PREVIEW_BYTES,
+};
 pub use stream::{HttpMessage, HttpTracker, StreamReassembler, MAX_STREAM_BUFFER};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +29,7 @@ pub struct HttpRequest {
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub content_length: Option<usize>,
+    pub body: HttpBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,4 +39,5 @@ pub struct HttpResponse {
     pub reason: String,
     pub headers: Vec<(String, String)>,
     pub content_length: Option<usize>,
+    pub body: HttpBody,
 }

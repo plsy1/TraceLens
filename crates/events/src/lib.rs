@@ -150,6 +150,11 @@ pub struct HttpEventData {
     pub reason: Option<String>,
     pub headers: Vec<HttpHeader>,
     pub content_length: Option<usize>,
+    pub body_preview: Option<String>,
+    pub body_bytes: usize,
+    pub body_truncated: bool,
+    pub payload_skipped: bool,
+    pub payload_skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,6 +193,10 @@ pub enum EventPayload {
         data: String,
         bytes: usize,
         truncated: bool,
+        #[serde(default)]
+        payload_skipped: bool,
+        #[serde(default)]
+        payload_skip_reason: Option<String>,
     },
     /// Bounded application bytes used internally to derive HTTP metadata.
     /// Core drops this raw event after parsing; it is not a persisted timeline row.
@@ -198,6 +207,10 @@ pub enum EventPayload {
         data: String,
         bytes: usize,
         truncated: bool,
+        #[serde(default)]
+        payload_skipped: bool,
+        #[serde(default)]
+        payload_skip_reason: Option<String>,
     },
     Http {
         direction: HttpMessageDirection,
@@ -209,6 +222,16 @@ pub enum EventPayload {
         reason: Option<String>,
         headers: Vec<HttpHeader>,
         content_length: Option<usize>,
+        #[serde(default)]
+        body_preview: Option<String>,
+        #[serde(default)]
+        body_bytes: usize,
+        #[serde(default)]
+        body_truncated: bool,
+        #[serde(default)]
+        payload_skipped: bool,
+        #[serde(default)]
+        payload_skip_reason: Option<String>,
     },
     File {
         path: String,
@@ -413,6 +436,8 @@ impl TraceEvent {
                 data: data.data,
                 bytes: data.bytes,
                 truncated: data.truncated,
+                payload_skipped: false,
+                payload_skip_reason: None,
             },
         }
     }
@@ -452,6 +477,11 @@ impl TraceEvent {
                 reason: data.reason,
                 headers: data.headers,
                 content_length: data.content_length,
+                body_preview: data.body_preview,
+                body_bytes: data.body_bytes,
+                body_truncated: data.body_truncated,
+                payload_skipped: data.payload_skipped,
+                payload_skip_reason: data.payload_skip_reason,
             },
         }
     }
@@ -481,6 +511,8 @@ impl TraceEvent {
                 data: data.data,
                 bytes: data.bytes,
                 truncated: data.truncated,
+                payload_skipped: false,
+                payload_skip_reason: None,
             },
         }
     }

@@ -38,7 +38,6 @@ static __always_inline int emit_plaintext(
     if (!event) {
         return 0;
     }
-    __builtin_memset(event, 0, sizeof(*event));
     event->event_type = TRACELENS_EVENT_PLAINTEXT;
     event->direction = direction;
     event->pid = pid_tgid >> 32;

@@ -118,6 +118,24 @@ impl CliOptions {
                         eprintln!("warning: --memory-event-limit requires a positive integer");
                     }
                 }
+                "--default-observation-level" => {
+                    if let Some(value) = args.next() {
+                        match value
+                            .parse::<u8>()
+                            .ok()
+                            .and_then(ObservationLevel::from_number)
+                        {
+                            Some(level) => config.default_observation_level = level,
+                            None => eprintln!(
+                                "warning: --default-observation-level requires a value from 1 to 5"
+                            ),
+                        }
+                    } else {
+                        eprintln!(
+                            "warning: --default-observation-level requires a value from 1 to 5"
+                        );
+                    }
+                }
                 "--observe" => observe = true,
                 "--print-example-event" => print_example_event = true,
                 "-h" | "--help" => help = true,

@@ -19,6 +19,10 @@ pub mod storage;
 pub mod tls;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use config::{CoreConfig, StorageMode};
 use detection::{Alert, DetectionEngine, RiskScore};
@@ -27,7 +31,7 @@ use events::{
     ConnectionTimeline, ConnectionTimelineFilter, ConnectionTimelinePage, EventBus,
     EventCorrelator, TimelineEntry, TimelineFilter, TimelinePage,
 };
-use http::{HttpMessage, HttpTracker};
+use http::{HttpMessage, HttpTracker, PayloadDecision};
 use network::ConnectionTracker;
 use observation::ObservationManager;
 use process::{read_process_ref, ProcessTracker};
@@ -38,6 +42,38 @@ use tracelens_events::{
     EventKind, EventPayload, EventSource, HttpEventData, HttpHeader, HttpMessageDirection,
     TlsEventData, TraceEvent,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureState {
+    Stopped,
+    Capturing,
+}
+
+impl std::fmt::Display for CaptureState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Stopped => "stopped",
+            Self::Capturing => "capturing",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureScope {
+    Global,
+    Process(u32),
+    ProcessName(String),
+}
+
+impl std::fmt::Display for CaptureScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => formatter.write_str("global"),
+            Self::Process(pid) => write!(formatter, "process:{pid}"),
+            Self::ProcessName(name) => write!(formatter, "process-name:{name}"),
+        }
+    }
+}
 
 /// Top-level composition root for the core service.
 pub struct Core {
@@ -55,6 +91,11 @@ pub struct Core {
     observations: ObservationManager,
     detection: DetectionEngine,
     alerts: Vec<Alert>,
+    capture_state: CaptureState,
+    capture_scope: CaptureScope,
+    observer_capture_mode: bool,
+    capture_started_at_ns: Option<u64>,
+    capture_gate: Option<Arc<AtomicBool>>,
 }
 
 impl Core {
@@ -102,6 +143,14 @@ impl Core {
             observations: ObservationManager::new(default_observation_level),
             detection: DetectionEngine::default(),
             alerts: Vec::new(),
+            // Library consumers historically use Core::new/open directly
+            // and feed it events. The observer process explicitly switches
+            // to Stopped before exposing the capture controls.
+            capture_state: CaptureState::Capturing,
+            capture_scope: CaptureScope::Global,
+            observer_capture_mode: false,
+            capture_started_at_ns: None,
+            capture_gate: None,
         }
     }
 
@@ -111,6 +160,39 @@ impl Core {
 
     pub fn runtime_status(&self) -> &RuntimeStatus {
         &self.runtime
+    }
+
+    pub fn capture_state(&self) -> CaptureState {
+        self.capture_state
+    }
+
+    pub fn is_capturing(&self) -> bool {
+        self.capture_state == CaptureState::Capturing
+    }
+
+    pub fn capture_scope(&self) -> &CaptureScope {
+        &self.capture_scope
+    }
+
+    /// Enable the live observer boundary. The library constructor leaves this
+    /// off so deterministic callers can use synthetic timestamps; the CLI
+    /// enables it so queued kernel events from before Start are discarded.
+    pub fn enable_observer_capture_mode(&mut self) {
+        self.observer_capture_mode = true;
+    }
+
+    /// Connect the live observer's event gate to the Core lifecycle. Kernel
+    /// tracepoints may remain loaded for fast Start, but callbacks must be
+    /// silent while the tool is stopped.
+    pub fn set_capture_gate(&mut self, gate: Arc<AtomicBool>) {
+        gate.store(self.is_capturing(), Ordering::Release);
+        self.capture_gate = Some(gate);
+    }
+
+    fn update_capture_gate(&self) {
+        if let Some(gate) = &self.capture_gate {
+            gate.store(self.is_capturing(), Ordering::Release);
+        }
     }
 
     pub fn probe_attachments(&self) -> Vec<ProbeAttachment> {
@@ -222,6 +304,7 @@ impl Core {
                 pid: filter.pid,
                 kind: filter.kind,
                 connection_id: filter.connection_id,
+                exclude_plaintext: !filter.include_plaintext,
                 offset: filter.offset,
                 limit: filter.limit,
             })
@@ -313,6 +396,7 @@ impl Core {
                 for event_id in self.connections.event_ids_for(&connection_id) {
                     let Ok(page) = self.store.query(EventQuery {
                         connection_id: Some(event_id),
+                        exclude_plaintext: !filter.include_plaintext,
                         limit: if filter.include_events {
                             filter.event_limit.clamp(1, 200)
                         } else {
@@ -401,11 +485,47 @@ impl Core {
     }
 
     pub fn ingest_event(&mut self, mut event: TraceEvent) {
+        if !self.is_capturing() {
+            return;
+        }
+        if self
+            .capture_started_at_ns
+            .is_some_and(|started_at| event.timestamp_ns < started_at)
+        {
+            return;
+        }
+        if !self.event_matches_capture_scope(&event) {
+            return;
+        }
         self.expire_observations();
         self.apply_event(&mut event);
-        let derived_http_events = self.derive_http_events(&event);
+        if !self.event_matches_capture_scope(&event) {
+            return;
+        }
+        let can_derive_http = !self.observer_capture_mode
+            || event
+                .pid
+                .map(|pid| self.effective_process_level(pid) >= observation::ObservationLevel::L4)
+                .unwrap_or(false);
+        let derived_http_events = if can_derive_http {
+            self.derive_http_events(&event)
+        } else {
+            Vec::new()
+        };
+        self.apply_payload_policy(&mut event);
 
+        // L4 uses the bounded plaintext probe internally to reconstruct HTTP
+        // messages. Keep those chunks private to the reassembler; L5 is the
+        // level that explicitly exposes raw plaintext. Library callers feed
+        // synthetic events directly and keep the historical event semantics.
+        let retain_plaintext = event.kind != EventKind::Plaintext
+            || !self.observer_capture_mode
+            || event
+                .pid
+                .map(|pid| self.effective_process_level(pid) >= observation::ObservationLevel::L5)
+                .unwrap_or(false);
         let persist_input = event.kind != EventKind::HttpCapture
+            && retain_plaintext
             && (!matches!(event.kind, EventKind::FileOpen | EventKind::FileRead)
                 || is_security_relevant_file_event(&event));
         let event = self.correlator.correlate(event);
@@ -440,9 +560,13 @@ impl Core {
                 .and_then(|pid| self.processes.get(pid))
                 .map(|record| record.identity.clone())
                 .or_else(|| {
-                    event
-                        .pid
-                        .and_then(|pid| read_process_ref(pid, event.timestamp_ns))
+                    (!self.observer_capture_mode)
+                        .then(|| {
+                            event
+                                .pid
+                                .and_then(|pid| read_process_ref(pid, event.timestamp_ns))
+                        })
+                        .flatten()
                 });
         }
 
@@ -452,8 +576,20 @@ impl Core {
             }
         }
 
+        // A ProcessExec event can arrive before the dynamic SSL library is
+        // mapped. Retry incomplete userspace attachments on every following
+        // event so the links are ready before the first SSL_read/SSL_write,
+        // rather than waiting for a later TCP packet and losing HTTP headers.
+        if !matches!(event.kind, EventKind::ProcessExec | EventKind::ProcessExit) {
+            self.retry_process_observation(event.pid);
+        }
+
         match event.kind {
-            EventKind::ProcessExec => {}
+            EventKind::ProcessExec => {
+                if let Some(pid) = event.pid {
+                    self.sync_process_observation(pid);
+                }
+            }
             EventKind::ProcessExit => {
                 if let Some(pid) = event.pid {
                     self.processes.remove(pid);
@@ -666,12 +802,7 @@ impl Core {
             } => (ssl_object, fd, direction, data, truncated),
             _ => return Vec::new(),
         };
-        let stream_key = event
-            .connection
-            .as_ref()
-            .map(|connection| connection.id.clone())
-            .or_else(|| (*ssl_object != 0).then(|| format!("process:{pid}:ssl:{ssl_object}")))
-            .or_else(|| fd.map(|fd| format!("process:{pid}:fd:{fd}")));
+        let stream_key = http_stream_key(event, pid, *ssl_object, *fd);
         let Some(stream_key) = stream_key else {
             return Vec::new();
         };
@@ -697,6 +828,11 @@ impl Core {
                             .map(|(name, value)| HttpHeader { name, value })
                             .collect(),
                         content_length: request.content_length,
+                        body_preview: request.body.preview,
+                        body_bytes: request.body.bytes,
+                        body_truncated: request.body.truncated,
+                        payload_skipped: request.body.skipped,
+                        payload_skip_reason: request.body.skip_reason,
                     },
                     HttpMessage::Response(response) => HttpEventData {
                         direction: HttpMessageDirection::Response,
@@ -712,6 +848,11 @@ impl Core {
                             .map(|(name, value)| HttpHeader { name, value })
                             .collect(),
                         content_length: response.content_length,
+                        body_preview: response.body.preview,
+                        body_bytes: response.body.bytes,
+                        body_truncated: response.body.truncated,
+                        payload_skipped: response.body.skipped,
+                        payload_skip_reason: response.body.skip_reason,
                     },
                 };
                 let mut http_event = TraceEvent::http_with_sequence(
@@ -727,6 +868,54 @@ impl Core {
                 http_event
             })
             .collect()
+    }
+
+    fn apply_payload_policy(&self, event: &mut TraceEvent) {
+        let Some(pid) = event.pid else {
+            return;
+        };
+        let (ssl_object, fd, direction) = match &event.payload {
+            EventPayload::Plaintext {
+                ssl_object,
+                fd,
+                direction,
+                ..
+            }
+            | EventPayload::HttpCapture {
+                ssl_object,
+                fd,
+                direction,
+                ..
+            } => (*ssl_object, *fd, *direction),
+            _ => return,
+        };
+        let Some(stream_key) = http_stream_key(event, pid, ssl_object, fd) else {
+            return;
+        };
+        let Some(PayloadDecision::Skip(reason)) = self.http.payload_policy(&stream_key, direction)
+        else {
+            return;
+        };
+
+        match &mut event.payload {
+            EventPayload::Plaintext {
+                data,
+                payload_skipped,
+                payload_skip_reason,
+                ..
+            }
+            | EventPayload::HttpCapture {
+                data,
+                payload_skipped,
+                payload_skip_reason,
+                ..
+            } => {
+                data.clear();
+                *payload_skipped = true;
+                *payload_skip_reason = Some(reason.to_owned());
+            }
+            _ => {}
+        }
     }
 
     fn apply_connection_event(&mut self, event: &mut TraceEvent) {
@@ -815,9 +1004,8 @@ impl Core {
 
     fn expire_observations(&mut self) {
         let expired = self.observations.sweep_expired();
-        for (target, level) in expired {
-            self.probe_runtime.detach_target(&target.to_string());
-            self.record_observation_event(target, level);
+        for (target, _level) in expired {
+            self.sync_observation_target(target);
         }
     }
 
@@ -826,6 +1014,9 @@ impl Core {
         target: observation::ObservationTarget,
         level: observation::ObservationLevel,
     ) {
+        if !self.is_capturing() {
+            return;
+        }
         let event =
             TraceEvent::observation_event(target.to_string(), level as u8, monotonic_now_ns());
         let event = self.correlator.correlate(event);
@@ -844,7 +1035,7 @@ impl Core {
             level,
             duration_secs.or(Some(self.config.deep_inspection_timeout_secs)),
         );
-        self.sync_observation_target(target, level);
+        self.sync_observation_target(target);
         level
     }
 
@@ -859,23 +1050,206 @@ impl Core {
             level,
             duration_secs: duration_secs.or(Some(self.config.deep_inspection_timeout_secs)),
         });
-        self.sync_observation_target(target, level);
-        level
+        let applied_level = self.observations.current_level(&target);
+        self.sync_observation_target(target);
+        applied_level
     }
 
-    fn sync_observation_target(
+    /// Apply an exact selector without an automatic timeout. Capture target
+    /// rules are explicit user configuration and should remain active until
+    /// the next target selection or reset.
+    pub fn set_persistent_observation(
         &mut self,
         target: observation::ObservationTarget,
         level: observation::ObservationLevel,
+    ) -> observation::ObservationLevel {
+        self.observations.apply(observation::ObservationRequest {
+            target: target.clone(),
+            level,
+            duration_secs: None,
+        });
+        let applied_level = self.observation_level_for_target(&target);
+        self.sync_observation_target(target);
+        applied_level
+    }
+
+    pub fn set_capture_scope(&mut self, scope: CaptureScope) {
+        self.capture_scope = scope;
+        if self.is_capturing() {
+            self.probe_runtime.detach_all();
+            self.sync_capture_scope();
+        }
+    }
+
+    /// Start a fresh live intake without deleting configured observation
+    /// selectors. Existing processes are discovered at this boundary so a
+    /// global or process-name selector can attach immediately, even though
+    /// their exec event happened before the button was pressed.
+    pub fn start_capture(&mut self) -> CaptureState {
+        if !self.is_capturing() {
+            self.capture_state = CaptureState::Capturing;
+            self.capture_started_at_ns = self.observer_capture_mode.then(monotonic_now_ns);
+            self.sync_capture_scope();
+            self.update_capture_gate();
+        }
+        self.capture_state
+    }
+
+    /// Stop the current capture session and release userspace hooks. Existing
+    /// events remain available for inspection; Reset is the command that
+    /// discards them.
+    pub fn stop_capture(&mut self) -> CaptureState {
+        self.capture_state = CaptureState::Stopped;
+        self.capture_started_at_ns = None;
+        self.update_capture_gate();
+        self.probe_runtime.detach_all();
+        self.capture_state
+    }
+
+    /// Discard all current-capture state and immediately start a new capture.
+    /// Observation rules are retained because they describe what the next
+    /// capture should inspect.
+    pub fn reset_capture(&mut self) -> Result<CaptureState, String> {
+        self.stop_capture();
+        self.store.clear()?;
+        self.event_bus = EventBus::new();
+        self.correlator = EventCorrelator::new();
+        self.processes = ProcessTracker::default();
+        self.connections = ConnectionTracker::default();
+        self.dns = DnsTracker::default();
+        self.tls = TlsTracker::default();
+        self.http = HttpTracker::default();
+        self.detection = DetectionEngine::default();
+        self.alerts.clear();
+        Ok(self.start_capture())
+    }
+
+    fn sync_observation_target(&mut self, target: observation::ObservationTarget) {
+        match &target {
+            observation::ObservationTarget::Process(pid) => {
+                self.discover_process(*pid);
+                self.sync_process_observation(*pid);
+            }
+            observation::ObservationTarget::ProcessName(name) => {
+                let _ = name;
+                let level = self.observations.current_level(&target);
+                self.sync_observation_probes(&target, level);
+            }
+            observation::ObservationTarget::Connection(_)
+            | observation::ObservationTarget::Domain(_) => {
+                let level = self.observations.current_level(&target);
+                self.sync_observation_probes(&target, level);
+            }
+        }
+        let level = self.observation_level_for_target(&target);
+        self.record_observation_event(target, level);
+    }
+
+    fn sync_observation_probes(
+        &mut self,
+        target: &observation::ObservationTarget,
+        level: observation::ObservationLevel,
     ) {
+        if !self.is_capturing() {
+            return;
+        }
         let target_name = target.to_string();
-        let process_pids = self.process_pids_for_target(&target);
+        let process_pids = self.process_pids_for_target(target);
         self.probe_runtime.detach_target(&target_name);
-        if level > self.observations.default_level() {
+        if level > observation::ObservationLevel::L1 {
             self.probe_runtime
                 .set_level(&target_name, level, &process_pids);
         }
-        self.record_observation_event(target, level);
+    }
+
+    fn sync_process_observation(&mut self, pid: u32) {
+        let target = observation::ObservationTarget::Process(pid);
+        let level = self.effective_process_level(pid);
+        if self.is_capturing() {
+            if self.process_in_capture_scope(pid) {
+                if matches!(self.capture_scope, CaptureScope::ProcessName(_)) {
+                    // Process-name selectors use a global libssl uprobe so a
+                    // new short-lived process is covered before its exec
+                    // event reaches this thread.
+                    return;
+                }
+                if matches!(self.capture_scope, CaptureScope::Global)
+                    && level <= self.observations.default_level()
+                    && self
+                        .probe_runtime
+                        .matches_level("global", self.observations.default_level())
+                {
+                    // Global capture already has one all-process probe set.
+                    // Do not add a second per-PID set when a process exec event
+                    // arrives after the global links were installed.
+                    return;
+                }
+                let target_name = target.to_string();
+                if !self.probe_runtime.matches_level(&target_name, level) {
+                    self.sync_observation_probes(&target, level);
+                }
+            } else {
+                self.probe_runtime.detach_target(&target.to_string());
+            }
+        }
+    }
+
+    fn retry_process_observation(&mut self, pid: Option<u32>) {
+        if let Some(pid) = pid {
+            self.sync_process_observation(pid);
+        }
+    }
+
+    fn sync_capture_scope(&mut self) {
+        match self.capture_scope.clone() {
+            CaptureScope::Global => {
+                let pids = self.discover_running_processes();
+                self.probe_runtime.detach_target("global");
+                let default_level = self.observations.default_level();
+                if default_level > observation::ObservationLevel::L1 {
+                    self.probe_runtime.set_level("global", default_level, &[]);
+                }
+                for pid in pids {
+                    if self.effective_process_level(pid) > default_level {
+                        self.sync_process_observation(pid);
+                    }
+                }
+            }
+            CaptureScope::Process(pid) => {
+                self.discover_process(pid);
+                self.sync_process_observation(pid);
+            }
+            CaptureScope::ProcessName(name) => {
+                for process in self
+                    .available_processes()
+                    .into_iter()
+                    .filter(|process| process.executable.as_deref() == Some(name.as_str()))
+                {
+                    self.processes.observe(
+                        process.clone(),
+                        process.start_time_ns.unwrap_or_else(monotonic_now_ns),
+                    );
+                }
+                let target = observation::ObservationTarget::ProcessName(name);
+                let level = self.observation_level_for_target(&target);
+                self.sync_observation_probes(&target, level);
+            }
+        }
+    }
+
+    /// Set the runtime-wide baseline for new and existing processes. The
+    /// setting is intentionally runtime-only; the CLI can be used when a
+    /// non-L1 baseline should be applied at startup.
+    pub fn set_default_observation_level(
+        &mut self,
+        level: observation::ObservationLevel,
+    ) -> observation::ObservationLevel {
+        self.config.default_observation_level = level;
+        self.observations.set_default_level(level);
+        if self.is_capturing() {
+            self.sync_capture_scope();
+        }
+        level
     }
 
     pub fn downgrade_observation(
@@ -883,8 +1257,7 @@ impl Core {
         target: &observation::ObservationTarget,
     ) -> observation::ObservationLevel {
         let level = self.observations.downgrade_to_default(target);
-        self.probe_runtime.detach_target(&target.to_string());
-        self.record_observation_event(target.clone(), level);
+        self.sync_observation_target(target.clone());
         level
     }
 
@@ -892,9 +1265,157 @@ impl Core {
         self.observations.statuses()
     }
 
+    pub fn observation_level_for_process(&self, pid: u32) -> observation::ObservationLevel {
+        self.effective_process_level(pid)
+    }
+
+    fn observation_level_for_target(
+        &self,
+        target: &observation::ObservationTarget,
+    ) -> observation::ObservationLevel {
+        match target {
+            observation::ObservationTarget::Process(pid) => self.effective_process_level(*pid),
+            observation::ObservationTarget::ProcessName(name) => self
+                .observations
+                .current_level(&observation::ObservationTarget::ProcessName(name.clone())),
+            observation::ObservationTarget::Connection(_)
+            | observation::ObservationTarget::Domain(_) => self.observations.current_level(target),
+        }
+    }
+
+    fn effective_process_level(&self, pid: u32) -> observation::ObservationLevel {
+        let process_level = self
+            .observations
+            .current_level(&observation::ObservationTarget::Process(pid));
+        let name_level = self
+            .processes
+            .get(pid)
+            .and_then(|record| record.identity.executable.as_deref())
+            .map(|name| {
+                self.observations
+                    .current_level(&observation::ObservationTarget::ProcessName(
+                        name.to_owned(),
+                    ))
+            })
+            .unwrap_or(observation::ObservationLevel::L1);
+        process_level.max(name_level)
+    }
+
+    fn process_in_capture_scope(&self, pid: u32) -> bool {
+        match &self.capture_scope {
+            CaptureScope::Global => true,
+            CaptureScope::Process(scope_pid) => *scope_pid == pid,
+            CaptureScope::ProcessName(name) => {
+                self.processes
+                    .get(pid)
+                    .and_then(|record| record.identity.executable.as_deref())
+                    == Some(name.as_str())
+            }
+        }
+    }
+
+    fn event_matches_capture_scope(&self, event: &TraceEvent) -> bool {
+        match &self.capture_scope {
+            CaptureScope::Global => true,
+            CaptureScope::Process(pid) => event.pid == Some(*pid),
+            CaptureScope::ProcessName(name) => {
+                let event_name = event
+                    .process
+                    .as_ref()
+                    .and_then(|process| process.executable.as_deref())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        event
+                            .pid
+                            .and_then(|pid| {
+                                self.processes
+                                    .get(pid)
+                                    .and_then(|record| record.identity.executable.as_deref())
+                            })
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| {
+                        if self.observer_capture_mode {
+                            None
+                        } else {
+                            event
+                                .pid
+                                .and_then(|pid| read_process_ref(pid, event.timestamp_ns))
+                                .and_then(|process| process.executable)
+                        }
+                    });
+                event_name.as_deref() == Some(name.as_str())
+            }
+        }
+    }
+
+    fn discover_process(&mut self, pid: u32) {
+        if self.processes.get(pid).is_some() {
+            return;
+        }
+        if let Some(process) = read_process_ref(pid, monotonic_now_ns()) {
+            self.processes.observe(process, monotonic_now_ns());
+        }
+    }
+
+    fn discover_running_processes(&mut self) -> Vec<u32> {
+        #[cfg(target_os = "linux")]
+        let pids = std::fs::read_dir("/proc")
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter_map(|pid| {
+                let process = read_process_ref(pid, monotonic_now_ns())?;
+                let timestamp_ns = process.start_time_ns.unwrap_or_else(monotonic_now_ns);
+                self.processes.observe(process, timestamp_ns);
+                Some(pid)
+            })
+            .collect::<Vec<_>>();
+
+        #[cfg(not(target_os = "linux"))]
+        let pids = self
+            .processes
+            .all()
+            .map(|record| record.identity.pid)
+            .collect::<Vec<_>>();
+
+        pids
+    }
+
+    /// Return a non-capturing process picker snapshot for the UI. Reading
+    /// `/proc` here does not add anything to the capture timeline or attach a
+    /// userspace probe; it only makes target selection possible before Start.
+    pub fn available_processes(&self) -> Vec<tracelens_events::ProcessRef> {
+        #[cfg(target_os = "linux")]
+        let mut processes = std::fs::read_dir("/proc")
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter_map(|pid| read_process_ref(pid, monotonic_now_ns()))
+            .collect::<Vec<_>>();
+
+        #[cfg(not(target_os = "linux"))]
+        let mut processes = Vec::new();
+
+        processes.sort_by(|left, right| {
+            left.executable
+                .cmp(&right.executable)
+                .then_with(|| left.pid.cmp(&right.pid))
+        });
+        processes
+    }
+
     fn process_pids_for_target(&self, target: &observation::ObservationTarget) -> Vec<u32> {
         let mut pids = match target {
             observation::ObservationTarget::Process(pid) => vec![*pid],
+            observation::ObservationTarget::ProcessName(name) => self
+                .processes
+                .all()
+                .filter(|record| record.identity.executable.as_deref() == Some(name.as_str()))
+                .map(|record| record.identity.pid)
+                .collect(),
             observation::ObservationTarget::Connection(id) => self
                 .connections
                 .get(id)
@@ -931,6 +1452,20 @@ impl Core {
             1_723_000_000_000_000_000,
         )
     }
+}
+
+fn http_stream_key(
+    event: &TraceEvent,
+    pid: u32,
+    ssl_object: u64,
+    fd: Option<i32>,
+) -> Option<String> {
+    event
+        .connection
+        .as_ref()
+        .map(|connection| connection.id.clone())
+        .or_else(|| (ssl_object != 0).then(|| format!("process:{pid}:ssl:{ssl_object}")))
+        .or_else(|| fd.map(|fd| format!("process:{pid}:fd:{fd}")))
 }
 
 fn fd_from_socket_id(connection_id: &str, pid: u32) -> Option<i32> {

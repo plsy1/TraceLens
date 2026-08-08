@@ -31,6 +31,10 @@ sudo ./target/debug/tracelens-core --observe --api-listen 127.0.0.1:8080
 This loads build/bpf/objects/process.o, network.o, and dns.o, attaches process,
 TCP state/byte, and DNS tracepoints, and serves the API including
 `/api/timeline?limit=50&offset=0&pid=&kind=&connection_id=`.
+The observer starts in `stopped` capture state. The Web UI or API must start a
+capture explicitly; events received while stopped are discarded. A capture
+can be scoped to `global`, `process:<pid>`, or `process-name:<name>` and can be
+paused or reset without retaining the previous in-memory session.
 When a process is upgraded to L3, Core additionally attaches the OpenSSL
 userspace objects and consumes TLS metadata ring-buffer events. The Timeline
 and connection APIs expose SNI, TLS version, SSL object/fd, and correlated
@@ -38,7 +42,7 @@ session data. L4 attaches a separate bounded `SSL_read`/`SSL_write` capture
 object and emits only parsed HTTP/1.1 request/response metadata (method, host,
 path, status, and headers); Core drops the raw capture after parsing. L5
 additionally attaches the plaintext object for on-demand payload inspection;
-each event is bounded to 512 captured bytes and includes its original byte
+each event is bounded to 16 KiB of captured bytes and includes its original byte
 count/truncation flag. L1-L3 do not attach either payload path.
 
 Timeline events stay in memory by default and are lost on restart. To enable
@@ -49,6 +53,15 @@ body such as:
 
 ```json
 {"target":"process:4242","level":3,"duration_secs":300}
+```
+
+The global baseline is read or changed with `GET`/`POST
+/api/observations/default`; the POST body is `{"level":4}`. A persistent
+capture selector can be applied with `persistent: true`, or by passing the
+target and level to `/api/capture/start`:
+
+```json
+{"target":"process-name:curl","level":4}
 ```
 
 Connection-oriented history is available from

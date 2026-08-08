@@ -33,7 +33,8 @@
 #define TRACELENS_TLS_VERSION_LEN 32
 #define TRACELENS_PLAINTEXT_READ 1
 #define TRACELENS_PLAINTEXT_WRITE 2
-#define TRACELENS_PLAINTEXT_MAX_LEN 512
+/* Keep ordinary HTML/JSON responses in one bounded SSL capture event. */
+#define TRACELENS_PLAINTEXT_MAX_LEN (16 * 1024)
 #define TRACELENS_FILE_PATH_LEN 256
 
 struct tracelens_process_event {

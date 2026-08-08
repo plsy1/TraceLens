@@ -1,4 +1,6 @@
-use super::{HttpRequest, HttpResponse, HttpVersion};
+use super::{
+    capture_body, payload_decision, HttpRequest, HttpResponse, HttpVersion, PayloadDecision,
+};
 
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -16,6 +18,14 @@ pub enum HttpParseResult<T> {
 pub struct HttpParser;
 
 impl HttpParser {
+    pub fn request_payload_policy(&self, buffer: &[u8]) -> Option<PayloadDecision> {
+        self.header_payload_policy(buffer, false)
+    }
+
+    pub fn response_payload_policy(&self, buffer: &[u8]) -> Option<PayloadDecision> {
+        self.header_payload_policy(buffer, true)
+    }
+
     pub fn parse_request(&self, buffer: &[u8]) -> Option<HttpRequest> {
         match self.parse_request_frame(buffer) {
             HttpParseResult::Complete { message, .. } => Some(message),
@@ -63,11 +73,15 @@ impl HttpParser {
         if consumed == usize::MAX {
             return HttpParseResult::Invalid;
         }
+        let Some(body_bytes) = extract_body(buffer, header_end, consumed, chunked) else {
+            return HttpParseResult::Invalid;
+        };
 
         let host = headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("host"))
             .map(|(_, value)| value.clone());
+        let body = capture_body(&headers, content_length, &body_bytes);
         HttpParseResult::Complete {
             message: HttpRequest {
                 version: HttpVersion::Http11,
@@ -76,6 +90,7 @@ impl HttpParser {
                 path: path.to_owned(),
                 headers,
                 content_length,
+                body,
             },
             consumed,
         }
@@ -118,7 +133,11 @@ impl HttpParser {
         if consumed == usize::MAX {
             return HttpParseResult::Invalid;
         }
+        let Some(body_bytes) = extract_body(buffer, header_end, consumed, chunked) else {
+            return HttpParseResult::Invalid;
+        };
 
+        let body = capture_body(&headers, body_length, &body_bytes);
         HttpParseResult::Complete {
             message: HttpResponse {
                 version: HttpVersion::Http11,
@@ -126,9 +145,35 @@ impl HttpParser {
                 reason: parts.next().unwrap_or_default().to_owned(),
                 headers,
                 content_length,
+                body,
             },
             consumed,
         }
+    }
+
+    fn header_payload_policy(&self, buffer: &[u8], response: bool) -> Option<PayloadDecision> {
+        let (_, lines) = header_lines(buffer).ok()??;
+        let start_line = lines.first()?;
+        if response {
+            let mut parts = start_line.splitn(3, ' ');
+            if parts.next()? != HttpVersion::Http11.as_str() {
+                return None;
+            }
+            let status = parts.next()?;
+            if status.len() != 3 || status.parse::<u16>().is_err() {
+                return None;
+            }
+        } else {
+            let mut parts = start_line.splitn(3, ' ');
+            let method = parts.next()?;
+            let path = parts.next()?;
+            if parts.next()? != HttpVersion::Http11.as_str() || !is_token(method) || path.is_empty()
+            {
+                return None;
+            }
+        }
+        let (headers, content_length, _) = parse_headers(&lines[1..])?;
+        Some(payload_decision(&headers, content_length))
     }
 }
 
@@ -206,6 +251,38 @@ fn body_end(
         return Some(usize::MAX);
     }
     (buffer.len() >= consumed).then_some(consumed)
+}
+
+fn extract_body(
+    buffer: &[u8],
+    header_end: usize,
+    consumed: usize,
+    chunked: bool,
+) -> Option<Vec<u8>> {
+    if !chunked {
+        return Some(buffer.get(header_end..consumed)?.to_vec());
+    }
+
+    let mut cursor = header_end;
+    let mut body = Vec::new();
+    loop {
+        let line_end = find_bytes(&buffer[cursor..], b"\r\n")?;
+        let line_end = cursor + line_end;
+        let size_text = std::str::from_utf8(&buffer[cursor..line_end]).ok()?;
+        let size_text = size_text.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_text, 16).ok()?;
+        cursor = line_end + 2;
+        if size == 0 {
+            return Some(body);
+        }
+        let chunk_end = cursor.checked_add(size)?;
+        let data_end = chunk_end.checked_add(2)?;
+        if data_end > consumed || &buffer[chunk_end..data_end] != b"\r\n" {
+            return None;
+        }
+        body.extend_from_slice(buffer.get(cursor..chunk_end)?);
+        cursor = data_end;
+    }
 }
 
 fn chunked_body_end(buffer: &[u8], body_start: usize) -> Option<usize> {
@@ -291,6 +368,7 @@ mod tests {
         assert_eq!(message.path, "/upload");
         assert_eq!(message.host.as_deref(), Some("example.com"));
         assert_eq!(message.content_length, Some(3));
+        assert_eq!(message.body.preview.as_deref(), Some("abc"));
     }
 
     #[test]
@@ -306,6 +384,7 @@ mod tests {
         };
         assert_eq!(message.status, 200);
         assert_eq!(message.reason, "OK");
+        assert_eq!(message.body.preview.as_deref(), Some("hello"));
     }
 
     #[test]
@@ -318,6 +397,7 @@ mod tests {
         };
         assert_eq!(message.method, "POST");
         assert_eq!(message.content_length, None);
+        assert_eq!(message.body.preview.as_deref(), Some("Wiki"));
         assert_eq!(
             &request[consumed..],
             b"GET /next HTTP/1.1\r\nHost: example.com\r\n\r\n"

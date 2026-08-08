@@ -40,6 +40,14 @@ impl ObservationManager {
         self.default_level
     }
 
+    /// Change the baseline applied to every target without removing higher
+    /// explicit overrides. Overrides that are now below the baseline no
+    /// longer add anything and can be discarded.
+    pub fn set_default_level(&mut self, level: ObservationLevel) {
+        self.default_level = level;
+        self.sessions.retain(|_, session| session.level > level);
+    }
+
     pub fn current_level(&self, target: &ObservationTarget) -> ObservationLevel {
         self.current_level_at(target, Instant::now())
     }
@@ -48,7 +56,7 @@ impl ObservationManager {
         self.sessions
             .get(target)
             .filter(|session| !is_expired(session.expires_at, now))
-            .map(|session| session.level)
+            .map(|session| session.level.max(self.default_level))
             .unwrap_or(self.default_level)
     }
 
@@ -227,5 +235,21 @@ mod tests {
             ObservationLevel::L5
         );
         assert_eq!(manager.current_level(&target), ObservationLevel::L5);
+    }
+
+    #[test]
+    fn global_default_is_used_for_all_targets_and_keeps_higher_overrides() {
+        let process = ObservationTarget::Process(42);
+        let mut manager = ObservationManager::new(ObservationLevel::L1);
+        manager.set_default_level(ObservationLevel::L4);
+        assert_eq!(manager.current_level(&process), ObservationLevel::L4);
+
+        manager.upgrade(process.clone(), ObservationLevel::L5, Some(30));
+        manager.set_default_level(ObservationLevel::L3);
+        assert_eq!(manager.current_level(&process), ObservationLevel::L5);
+
+        manager.set_default_level(ObservationLevel::L5);
+        assert_eq!(manager.current_level(&process), ObservationLevel::L5);
+        assert!(manager.statuses().is_empty());
     }
 }

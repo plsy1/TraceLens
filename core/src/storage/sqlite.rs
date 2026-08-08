@@ -15,6 +15,7 @@ pub struct EventQuery {
     pub pid: Option<u32>,
     pub kind: Option<EventKind>,
     pub connection_id: Option<String>,
+    pub exclude_plaintext: bool,
     /// Number of newest matching events to skip before returning older rows.
     pub offset: usize,
     pub limit: usize,
@@ -118,6 +119,31 @@ impl EventStore {
     pub fn insert(&self, event: TraceEvent) {
         if let Err(error) = self.try_insert(&event) {
             eprintln!("TraceLens event store write failed: {error}");
+        }
+    }
+
+    /// Remove every event from the current capture. This is intentionally an
+    /// explicit operation: memory is the default backend, while a user who
+    /// opted into SQLite should get the same reset semantics from the UI.
+    pub fn clear(&self) -> Result<(), String> {
+        match &self.backend {
+            StoreBackend::Memory(state) => {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| "event store lock poisoned".to_owned())?;
+                state.events.clear();
+                state.next_sequence = 0;
+                Ok(())
+            }
+            StoreBackend::Sqlite(connection) => {
+                let connection = connection
+                    .lock()
+                    .map_err(|_| "event store lock poisoned".to_owned())?;
+                connection
+                    .execute("DELETE FROM timeline_events", [])
+                    .map_err(|error| format!("clear timeline events: {error}"))?;
+                Ok(())
+            }
         }
     }
 
@@ -246,6 +272,7 @@ fn query_memory(state: &Arc<Mutex<MemoryState>>, query: &EventQuery) -> Result<E
 fn matches_query(event: &TraceEvent, query: &EventQuery) -> bool {
     query.pid.is_none_or(|pid| event.pid == Some(pid))
         && query.kind.is_none_or(|kind| event.kind == kind)
+        && (!query.exclude_plaintext || event.kind != EventKind::Plaintext)
         && query.connection_id.as_ref().is_none_or(|connection_id| {
             event
                 .connection
@@ -322,6 +349,10 @@ fn build_filter(query: &EventQuery) -> (String, Vec<Box<dyn ToSql>>) {
     if let Some(kind) = query.kind {
         clauses.push("kind = ?".to_owned());
         values.push(Box::new(event_kind_name(kind)));
+    }
+    if query.exclude_plaintext {
+        clauses.push("kind <> ?".to_owned());
+        values.push(Box::new(event_kind_name(EventKind::Plaintext)));
     }
     if let Some(connection_id) = &query.connection_id {
         clauses.push("connection_id = ?".to_owned());
@@ -426,6 +457,9 @@ mod tests {
         assert_eq!(page.total, 2);
         assert_eq!(page.events[0].timestamp_ns, 2);
         assert_eq!(page.events[1].timestamp_ns, 3);
+
+        store.clear().expect("clear memory store");
+        assert!(store.is_empty());
     }
 
     #[test]

@@ -40,7 +40,12 @@ pub fn probes_for_level(level: ObservationLevel) -> Vec<ProbeKind> {
         probes.push(ProbeKind::Tls);
     }
     if level == ObservationLevel::L4 {
-        probes.push(ProbeKind::Http);
+        // Use the bounded SSL payload capture as the transport for HTTP
+        // reconstruction. The dedicated HTTP object has the same hooks, but
+        // is not reliable on every kernel/libbpf combination. Core derives
+        // HTTP messages from these chunks and only exposes those messages at
+        // L4; raw chunks remain an L5-only view.
+        probes.push(ProbeKind::Plaintext);
     }
     if level >= ObservationLevel::L5 {
         probes.push(ProbeKind::Plaintext);
