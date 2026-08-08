@@ -7,8 +7,9 @@
 - Phase 1：项目骨架、共享事件模型、eBPF/Cargo/CMake/UI 工具链已完成。
 - Phase 2 初版：已实现进程 exec/exit eBPF 事件、`/proc` 元数据补全、Rust 进程 Tracker 和只读 API。
 - Phase 3：已实现 IPv4/IPv6 connect/close、PID/FD 关联、上传/下载字节计数、TCP 状态事件、进程快照和 UI 连接表；closed 历史连接支持勾选显示。
-- Phase 4 初版：已实现 DNS query/response 事件、A/AAAA 解析、TTL 缓存和连接域名关联。
-- Phase 3/4 待补：更完整的 UDP/TCP DNS 覆盖、连接失败原因、持久化和域名冲突消歧。
+- Phase 4：已实现 UDP/TCP DNS query/response、A/AAAA 解析、TTL/负响应缓存、FD 清理、进程优先和 resolver 全局兜底的连接域名关联。
+- Phase 5 初版：已实现 Process/DNS/Network 统一 Timeline、`/api/timeline` 和 UI 时间线。
+- 后续待补：连接失败原因、更完整的入站连接覆盖、Timeline 持久化、域名事务级消歧和 privileged eBPF E2E 测试。
 
 当前验收方式：启动 observer 后运行 `curl https://example.com`，在 dashboard 中查看真实进程、域名、TCP 状态和流量元数据。
 
@@ -2195,7 +2196,6 @@ L2 / L4 可以后补。
 待实现：
 
 - 连接失败原因和更完整的入站连接覆盖
-- UDP/TCP DNS 边界情况
 
 ---
 
@@ -2205,7 +2205,12 @@ L2 / L4 可以后补。
 
 - DNS query
 - response
-- domain cache
+- UDP/TCP socket protocol tracking
+- connected `sendto`/`recvfrom`、`sendmsg`/`recvmsg`、`read`/`write` 覆盖
+- DNS socket FD close 清理
+- A/AAAA 解析
+- TTL 和空答案/负响应处理
+- 进程优先、resolver 进程全局兜底的 domain cache
 - connection correlation
 
 最终 UI：
@@ -2219,15 +2224,15 @@ python
 
 ## Phase 5：Timeline
 
-统一：
+当前已完成初版：
 
-Process
-+
-Network
-+
-DNS
+- Core 按 timestamp 聚合 Process、Network、DNS 事件
+- TimelineEntry 统一读模型
+- `/api/timeline?limit=50&offset=0&pid=&kind=` 只读接口
+- PID/事件类型过滤和向更早事件翻页
+- UI Timeline 筛选器、事件总数和 Load older 交互
 
-事件 Timeline。
+后续补充：持久化历史查询和按连接 ID 过滤。
 
 ---
 

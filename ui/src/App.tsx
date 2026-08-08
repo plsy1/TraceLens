@@ -37,10 +37,39 @@ type ConnectionRow = {
   domain: string | null;
 };
 
+type TimelineEntry = {
+  id: string;
+  timestamp_ns: number;
+  source: string;
+  kind: string;
+  pid: number | null;
+  process_name: string | null;
+  process_command_line: string | null;
+  summary: string;
+  domain: string | null;
+  addresses: string[];
+  protocol: string | null;
+  connection_id: string | null;
+  remote: Endpoint | null;
+  state: string | null;
+  tcp_state: string | null;
+  sent_bytes: number | null;
+  received_bytes: number | null;
+};
+
+type TimelinePage = {
+  entries: TimelineEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+};
+
 type Snapshot = {
   summary: Summary;
   processes: ProcessRow[];
   connections: ConnectionRow[];
+  timeline: TimelinePage;
   mode: "demo" | "live";
 };
 
@@ -66,10 +95,23 @@ const demoConnections: ConnectionRow[] = [
   { id: "demo-python", pid: 9172, process_name: "python3", process_command_line: "python3 uploader.py", protocol: "tcp", remote: { address: "203.0.113.42", port: 443 }, state: "established", tcp_state: "established", sent_bytes: 500_000_000, received_bytes: 0, domain: "suspicious.example" },
 ];
 
+const demoTimeline: TimelineEntry[] = [
+  { id: "demo-timeline-1", timestamp_ns: 1_723_000_000_000_000_000, source: "kernel", kind: "process_exec", pid: 12345, process_name: "curl", process_command_line: "curl https://example.com", summary: "curl started", domain: null, addresses: [], protocol: null, connection_id: null, remote: null, state: null, tcp_state: null, sent_bytes: null, received_bytes: null },
+  { id: "demo-timeline-2", timestamp_ns: 1_723_000_001_000_000_000, source: "kernel", kind: "dns_response", pid: 12345, process_name: "curl", process_command_line: "curl https://example.com", summary: "DNS response for example.com", domain: "example.com", addresses: ["93.184.216.34"], protocol: "udp", connection_id: null, remote: null, state: null, tcp_state: null, sent_bytes: null, received_bytes: null },
+  { id: "demo-timeline-3", timestamp_ns: 1_723_000_002_000_000_000, source: "kernel", kind: "tcp_connect", pid: 12345, process_name: "curl", process_command_line: "curl https://example.com", summary: "Connected to example.com:443", domain: "example.com", addresses: [], protocol: "tcp", connection_id: "demo-curl", remote: { address: "93.184.216.34", port: 443 }, state: "established", tcp_state: "established", sent_bytes: 8_000, received_bytes: 10_432 },
+];
+
 const initialSnapshot: Snapshot = {
   summary: demoSummary,
   processes: demoProcesses,
   connections: demoConnections,
+  timeline: {
+    entries: demoTimeline,
+    total: demoTimeline.length,
+    offset: 0,
+    limit: 50,
+    has_more: false,
+  },
   mode: "demo",
 };
 
@@ -81,12 +123,30 @@ async function fetchJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function buildTimelinePath(kind: string, pid: string, offset: number): string {
+  const params = new URLSearchParams({ limit: "50", offset: String(offset) });
+  if (kind !== "all") params.set("kind", kind);
+  if (/^\d+$/.test(pid.trim())) params.set("pid", pid.trim());
+  return `/api/timeline?${params.toString()}`;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "—";
   if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
+}
+
+function formatTimestamp(timestampNs: number, originNs: number): string {
+  const deltaNs = Math.max(0, timestampNs - originNs);
+  const totalSeconds = Math.floor(deltaNs / 1_000_000_000);
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `T+${hours}h ${minutes}m`;
+  if (minutes > 0) return `T+${minutes}m ${seconds}s`;
+  return `T+${seconds}s`;
 }
 
 function stateLabel(state: string): string {
@@ -96,25 +156,70 @@ function stateLabel(state: string): string {
     .join(" ");
 }
 
+function timelineKindLabel(kind: string): string {
+  return kind
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot);
   const [loading, setLoading] = useState(false);
   const [showClosedConnections, setShowClosedConnections] = useState(false);
+  const [timelineKind, setTimelineKind] = useState("all");
+  const [timelinePidInput, setTimelinePidInput] = useState("");
+  const [timelinePid, setTimelinePid] = useState("");
+
+  const timelineRequestPath = useMemo(
+    () => buildTimelinePath(timelineKind, timelinePid, 0),
+    [timelineKind, timelinePid],
+  );
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [summary, processes, connections] = await Promise.all([
+      const [summary, processes, connections, timeline] = await Promise.all([
         fetchJson<Summary>("/api/summary"),
         fetchJson<ProcessRow[]>("/api/processes"),
         fetchJson<ConnectionRow[]>("/api/connections"),
+        fetchJson<TimelinePage>(timelineRequestPath),
       ]);
-      setSnapshot({ summary, processes, connections, mode: "live" });
+      setSnapshot({ summary, processes, connections, timeline, mode: "live" });
     } catch {
       setSnapshot((current) => ({ ...current, mode: current.mode === "live" ? "live" : "demo" }));
     } finally {
       setLoading(false);
     }
+  }, [timelineRequestPath]);
+
+  const loadOlderTimeline = useCallback(async () => {
+    const nextOffset = snapshot.timeline.offset + snapshot.timeline.entries.length;
+    try {
+      const olderPage = await fetchJson<TimelinePage>(
+        buildTimelinePath(timelineKind, timelinePid, nextOffset),
+      );
+      setSnapshot((current) => ({
+        ...current,
+        timeline: {
+          ...olderPage,
+          offset: olderPage.offset + olderPage.entries.length,
+          entries: [...olderPage.entries, ...current.timeline.entries],
+        },
+      }));
+    } catch {
+      // Keep the current page visible if the history request fails.
+    }
+  }, [snapshot.timeline.entries.length, snapshot.timeline.offset, timelineKind, timelinePid]);
+
+  const applyTimelinePid = useCallback(() => {
+    setTimelinePid(timelinePidInput.trim());
+  }, [timelinePidInput]);
+
+  const resetTimelineFilters = useCallback(() => {
+    setTimelineKind("all");
+    setTimelinePidInput("");
+    setTimelinePid("");
   }, []);
 
   useEffect(() => {
@@ -273,6 +378,80 @@ function App() {
             </tbody>
           </table>
         </div>
+      </section>
+
+      <section className="panel timeline-panel">
+        <div className="panel-heading timeline-heading">
+          <div>
+            <p className="eyebrow">UNIFIED EVENT STREAM</p>
+            <h2>Timeline</h2>
+          </div>
+          <div className="timeline-toolbar">
+            <label className="timeline-filter">
+              <span>Event</span>
+              <select value={timelineKind} onChange={(event) => setTimelineKind(event.target.value)}>
+                <option value="all">All events</option>
+                <option value="process_exec">Process start</option>
+                <option value="process_exit">Process exit</option>
+                <option value="dns_query">DNS query</option>
+                <option value="dns_response">DNS response</option>
+                <option value="tcp_connect">TCP connect</option>
+                <option value="tcp_state_changed">TCP state</option>
+                <option value="tcp_bytes">TCP bytes</option>
+                <option value="tcp_close">TCP close</option>
+              </select>
+            </label>
+            <label className="timeline-filter">
+              <span>PID</span>
+              <input
+                inputMode="numeric"
+                placeholder="Any"
+                value={timelinePidInput}
+                onChange={(event) => setTimelinePidInput(event.target.value.replace(/\D/g, ""))}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") applyTimelinePid();
+                }}
+              />
+            </label>
+            <button className="ghost-button" onClick={applyTimelinePid} disabled={loading}>Apply</button>
+            <button className="ghost-button" onClick={resetTimelineFilters} disabled={loading}>Reset</button>
+          </div>
+          <span className="connection-count">{snapshot.timeline.total} matching events</span>
+        </div>
+        <div className="timeline-list">
+          {snapshot.timeline.entries.length === 0 ? (
+            <p className="muted empty-cell">No timeline events observed yet.</p>
+          ) : snapshot.timeline.entries.slice().reverse().map((entry) => (
+            <article className="timeline-item" key={entry.id}>
+              <time className="timeline-time">
+                {formatTimestamp(entry.timestamp_ns, snapshot.timeline.entries[0]?.timestamp_ns ?? entry.timestamp_ns)}
+              </time>
+              <span className={`timeline-marker timeline-marker-${entry.kind}`} />
+              <div className="timeline-content">
+                <div className="timeline-meta">
+                  <span className="timeline-kind">{timelineKindLabel(entry.kind)}</span>
+                  {entry.process_name && <span className="muted">{entry.process_name}</span>}
+                  {entry.pid !== null && <span className="muted">PID {entry.pid}</span>}
+                </div>
+                <strong>{entry.summary}</strong>
+                <p>
+                  {entry.addresses.length > 0
+                    ? entry.addresses.join(", ")
+                    : entry.remote
+                      ? `${entry.remote.address}:${entry.remote.port}`
+                      : entry.domain ?? entry.protocol ?? "metadata event"}
+                </p>
+              </div>
+            </article>
+          ))}
+        </div>
+        {snapshot.timeline.has_more && (
+          <div className="timeline-footer">
+            <button className="ghost-button timeline-load-more" onClick={() => void loadOlderTimeline()}>
+              Load older events
+            </button>
+          </div>
+        )}
       </section>
     </main>
   );

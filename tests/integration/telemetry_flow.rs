@@ -1,4 +1,8 @@
-use tracelens_core::{config::CoreConfig, Core};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+
+use tracelens_core::{api::server, config::CoreConfig, events::TimelineFilter, Core};
 use tracelens_events::{
     ConnectionRef, ConnectionState, Endpoint, EventKind, EventSource, TcpState, TraceEvent,
     TransportProtocol,
@@ -155,6 +159,48 @@ fn correlates_process_dns_and_connection_telemetry() {
             port: 51515,
         })
     );
+
+    let timeline = core.timeline(20);
+    assert_eq!(timeline.len(), 5);
+    assert_eq!(timeline[0].kind, EventKind::ProcessExec);
+    assert_eq!(timeline[1].kind, EventKind::DnsResponse);
+    assert_eq!(timeline[1].process_name.as_deref(), Some("curl"));
+    assert_eq!(timeline[1].domain.as_deref(), Some("example.net"));
+    assert_eq!(timeline[2].kind, EventKind::TcpConnect);
+    assert_eq!(timeline[4].kind, EventKind::TcpBytes);
+
+    let dns_page = core.timeline_page(TimelineFilter {
+        kind: Some(EventKind::DnsResponse),
+        limit: 1,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(dns_page.total, 1);
+    assert_eq!(dns_page.entries[0].kind, EventKind::DnsResponse);
+
+    let latest_page = core.timeline_page(TimelineFilter {
+        limit: 2,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(latest_page.entries.len(), 2);
+    assert!(latest_page.has_more);
+    assert_eq!(latest_page.entries[1].kind, EventKind::TcpBytes);
+
+    let older_page = core.timeline_page(TimelineFilter {
+        limit: 2,
+        offset: 2,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(older_page.entries[0].kind, EventKind::DnsResponse);
+    assert_eq!(older_page.entries[1].kind, EventKind::TcpConnect);
+    assert!(older_page.has_more);
+
+    let oldest_page = core.timeline_page(TimelineFilter {
+        limit: 2,
+        offset: 4,
+        ..TimelineFilter::default()
+    });
+    assert_eq!(oldest_page.entries[0].kind, EventKind::ProcessExec);
+    assert!(!oldest_page.has_more);
 }
 
 #[test]
@@ -251,4 +297,85 @@ fn does_not_correlate_connection_after_dns_ttl_expires() {
         .next()
         .expect("the connection should still be tracked");
     assert_eq!(record.connection.domain, None);
+}
+
+#[test]
+fn serves_timeline_through_the_read_only_api() {
+    let mut core = Core::new(CoreConfig::default());
+    core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+    let core = Arc::new(Mutex::new(core));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test API listener");
+    let address = listener.local_addr().expect("read test API address");
+    let server_core = Arc::clone(&core);
+    let server = std::thread::spawn(move || server::serve_once(listener, server_core));
+
+    let mut client = TcpStream::connect(address).expect("connect test API listener");
+    client
+        .write_all(
+            b"GET /api/timeline?limit=1&pid=4242&kind=process_exec HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write API request");
+    let mut response = String::new();
+    client
+        .read_to_string(&mut response)
+        .expect("read API response");
+    server
+        .join()
+        .expect("API server thread should finish")
+        .expect("API request should succeed");
+
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("HTTP response body");
+    let page: serde_json::Value = serde_json::from_str(body).expect("timeline JSON");
+    let entries = page["entries"].as_array().expect("timeline entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["has_more"], false);
+    assert_eq!(entries[0]["kind"], "process_exec");
+    assert_eq!(entries[0]["process_name"], "curl");
+}
+
+#[test]
+fn correlates_domains_from_a_separate_system_resolver_process() {
+    let mut core = Core::new(CoreConfig::default());
+    let resolver_pid = 53;
+    let connection_pid = 9001;
+
+    let mut connection = connection(
+        "resolver-backed-socket",
+        None,
+        ConnectionState::Established,
+        TcpState::Established,
+        0,
+        0,
+    );
+    connection.remote.port = 443;
+    core.ingest_event(TraceEvent::connection_event(
+        EventSource::Kernel,
+        EventKind::TcpConnect,
+        connection_pid,
+        connection,
+        BASE_TIME_NS + 1,
+    ));
+    core.ingest_event(TraceEvent::dns_event(
+        EventSource::Kernel,
+        EventKind::DnsResponse,
+        resolver_pid,
+        "resolver.example",
+        vec![FAKE_IP.to_owned()],
+        60,
+        BASE_TIME_NS + 2,
+    ));
+
+    let record = core
+        .connections()
+        .all()
+        .next()
+        .expect("resolver-backed connection");
+    assert_eq!(
+        record.connection.domain.as_deref(),
+        Some("resolver.example")
+    );
 }

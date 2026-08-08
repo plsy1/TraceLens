@@ -25,4 +25,11 @@ impl EventStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    pub fn snapshot(&self) -> Vec<TraceEvent> {
+        self.events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default()
+    }
 }

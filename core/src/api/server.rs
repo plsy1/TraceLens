@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde::Serialize;
-use tracelens_events::{ConnectionState, TcpState, TransportProtocol};
+use tracelens_events::{ConnectionState, EventKind, TcpState, TransportProtocol};
 
+use crate::events::TimelineFilter;
 use crate::observation::{ObservationLevel, ObservationTarget};
 use crate::Core;
 
@@ -81,6 +82,13 @@ pub fn serve(core: Arc<Mutex<Core>>, listen: SocketAddr) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Serve one request on a pre-bound listener. This keeps API contract tests
+/// deterministic without starting an unbounded server thread.
+pub fn serve_once(listener: TcpListener, core: Arc<Mutex<Core>>) -> std::io::Result<()> {
+    let (stream, _) = listener.accept()?;
+    handle_connection(stream, &core)
+}
+
 fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io::Result<()> {
     let mut buffer = [0_u8; 8192];
     let bytes_read = stream.read(&mut buffer)?;
@@ -91,7 +99,8 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
         .unwrap_or_default()
         .split_whitespace();
     let method = request_line.next().unwrap_or_default();
-    let path = request_line.next().unwrap_or_default();
+    let raw_path = request_line.next().unwrap_or_default();
+    let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
 
     if method == "OPTIONS" {
         return write_response(&mut stream, 204, "", "text/plain");
@@ -211,6 +220,10 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                 .collect::<Vec<_>>();
             Ok(connections)
         }),
+        "/api/timeline" => response_json(|| {
+            let core = core.lock().map_err(|_| "core lock poisoned")?;
+            Ok(core.timeline_page(timeline_filter(query)))
+        }),
         _ => {
             return write_response(
                 &mut stream,
@@ -230,6 +243,42 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
             "application/json",
         ),
     }
+}
+
+fn timeline_filter(query: &str) -> TimelineFilter {
+    TimelineFilter {
+        pid: query_parameter(query, "pid").and_then(|value| value.parse().ok()),
+        kind: query_parameter(query, "kind").and_then(parse_event_kind),
+        offset: query_parameter(query, "offset")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        limit: query_parameter(query, "limit")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(50)
+            .clamp(1, 200),
+    }
+}
+
+fn query_parameter<'query>(query: &'query str, name: &str) -> Option<&'query str> {
+    query.split('&').find_map(|parameter| {
+        let (parameter_name, value) = parameter.split_once('=')?;
+        (parameter_name == name).then_some(value)
+    })
+}
+
+fn parse_event_kind(value: &str) -> Option<EventKind> {
+    Some(match value {
+        "process_exec" => EventKind::ProcessExec,
+        "process_exit" => EventKind::ProcessExit,
+        "tcp_connect" => EventKind::TcpConnect,
+        "tcp_close" => EventKind::TcpClose,
+        "tcp_state_changed" => EventKind::TcpStateChanged,
+        "tcp_bytes" => EventKind::TcpBytes,
+        "dns_query" => EventKind::DnsQuery,
+        "dns_response" => EventKind::DnsResponse,
+        "observation_changed" => EventKind::ObservationChanged,
+        _ => return None,
+    })
 }
 
 fn read_process_name(pid: u32) -> Option<String> {

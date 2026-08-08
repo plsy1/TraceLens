@@ -9,8 +9,8 @@ use std::{net::IpAddr, net::Ipv4Addr, net::Ipv6Addr};
 
 use libbpf_rs::{Link, MapCore, Object, ObjectBuilder, RingBufferBuilder};
 use tracelens_events::{
-    ConnectionRef, ConnectionState, Endpoint, EventKind, EventSource, ProcessRef, TcpState,
-    TraceEvent, TransportProtocol,
+    ConnectionRef, ConnectionState, DnsEventData, Endpoint, EventKind, EventSource, ProcessRef,
+    TcpState, TraceEvent, TransportProtocol,
 };
 
 use crate::config::CoreConfig;
@@ -26,6 +26,7 @@ const EVENT_TCP_BYTES: u16 = 10;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 const IPPROTO_TCP: u16 = 6;
+const IPPROTO_UDP: u16 = 17;
 const COMM_LEN: usize = 16;
 const ADDR_LEN: usize = 16;
 const DNS_PAYLOAD_LEN: usize = 512;
@@ -90,7 +91,7 @@ impl KernelRuntime {
         self.attached = false;
     }
 
-    /// Load the Phase 2/3 objects, attach their tracepoints, and forward events.
+    /// Load the process/network/DNS objects, attach their tracepoints, and forward events.
     pub fn run(config: &CoreConfig, sender: Sender<TraceEvent>) -> Result<(), String> {
         let process_path = config.bpf_object_dir.join("process.o");
         let network_path = config.bpf_object_dir.join("network.o");
@@ -133,6 +134,7 @@ impl KernelRuntime {
         let _dns_write_link = attach_program(&mut dns_object, "tracelens_dns_write")?;
         let _dns_read_link = attach_program(&mut dns_object, "tracelens_dns_read")?;
         let _dns_read_exit_link = attach_program(&mut dns_object, "tracelens_dns_read_exit")?;
+        let _dns_close_link = attach_program(&mut dns_object, "tracelens_dns_close")?;
 
         let process_events = find_map(&process_object, "events")?;
         let network_events = find_map(&network_object, "events")?;
@@ -315,19 +317,27 @@ fn decode_dns_event(data: &[u8]) -> Option<TraceEvent> {
         EVENT_DNS_RESPONSE => true,
         _ => return None,
     };
+    let protocol = match event.protocol {
+        IPPROTO_TCP => TransportProtocol::Tcp,
+        IPPROTO_UDP => TransportProtocol::Udp,
+        _ => return None,
+    };
     let dns = parse_dns_message(payload, is_response)?;
     let kind = if is_response {
         EventKind::DnsResponse
     } else {
         EventKind::DnsQuery
     };
-    Some(TraceEvent::dns_event(
+    Some(TraceEvent::dns_event_with_data(
         EventSource::Kernel,
         kind,
         event.pid,
-        &dns.domain,
-        dns.addresses,
-        dns.ttl_secs,
+        DnsEventData {
+            protocol,
+            domain: dns.domain,
+            addresses: dns.addresses,
+            ttl_secs: dns.ttl_secs,
+        },
         event.timestamp_ns,
     ))
 }

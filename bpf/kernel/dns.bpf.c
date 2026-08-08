@@ -35,9 +35,15 @@ struct tracelens_socket_key {
     __u32 fd;
 };
 
+struct tracelens_dns_socket {
+    __u16 protocol;
+};
+
 struct tracelens_dns_recv_request {
     __u32 pid;
     __u32 fd;
+    __u16 protocol;
+    __u16 reserved;
     void *buffer;
 };
 
@@ -55,7 +61,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
     __type(key, struct tracelens_socket_key);
-    __type(value, __u8);
+    __type(value, struct tracelens_dns_socket);
 } dns_sockets SEC(".maps");
 
 struct {
@@ -87,22 +93,29 @@ static __always_inline int is_dns_destination(const void *address, __u32 address
         bpf_ntohs(port) == 53;
 }
 
-static __always_inline int socket_is_dns(__u32 pid, __u32 fd)
+static __always_inline int socket_dns_protocol(__u32 pid, __u32 fd, __u16 *protocol)
 {
     struct tracelens_socket_key key = {};
+    struct tracelens_dns_socket *socket;
 
     key.pid = pid;
     key.fd = fd;
-    return bpf_map_lookup_elem(&dns_sockets, &key) != 0;
+    socket = bpf_map_lookup_elem(&dns_sockets, &key);
+    if (!socket) {
+        return 0;
+    }
+    *protocol = socket->protocol;
+    return 1;
 }
 
-static __always_inline void mark_dns_socket(__u32 pid, __u32 fd)
+static __always_inline void mark_dns_socket(__u32 pid, __u32 fd, __u16 protocol)
 {
     struct tracelens_socket_key key = {};
-    __u8 value = 1;
+    struct tracelens_dns_socket value = {};
 
     key.pid = pid;
     key.fd = fd;
+    value.protocol = protocol;
     bpf_map_update_elem(&dns_sockets, &key, &value, BPF_ANY);
 }
 
@@ -135,6 +148,7 @@ static __always_inline int emit_dns_event(
     __u16 event_type,
     __u32 pid,
     __u32 fd,
+    __u16 protocol,
     const void *buffer,
     __u32 buffer_length)
 {
@@ -167,7 +181,7 @@ static __always_inline int emit_dns_event(
     }
 
     event->event_type = event_type;
-    event->protocol = TRACELENS_IPPROTO_UDP;
+    event->protocol = protocol;
     event->pid = pid;
     event->socket_id = ((__u64)pid << 32) | fd;
     event->timestamp_ns = bpf_ktime_get_ns();
@@ -179,24 +193,29 @@ static __always_inline int emit_dns_event(
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int tracelens_dns_send(struct trace_event_raw_sys_enter *ctx)
 {
-    struct tracelens_socket_key key = {};
+    __u16 protocol = TRACELENS_IPPROTO_UDP;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 fd = (__u32)ctx->args[0];
 
     if (!is_dns_destination(
             (const void *)(unsigned long)ctx->args[4],
-            (__u32)ctx->args[5]) && !socket_is_dns(pid, fd)) {
+            (__u32)ctx->args[5]) &&
+        !socket_dns_protocol(pid, fd, &protocol)) {
         return 0;
     }
 
-    key.pid = pid;
-    key.fd = fd;
-    mark_dns_socket(pid, fd);
+    if (is_dns_destination(
+            (const void *)(unsigned long)ctx->args[4],
+            (__u32)ctx->args[5])) {
+        protocol = TRACELENS_IPPROTO_UDP;
+        mark_dns_socket(pid, fd, protocol);
+    }
     return emit_dns_event(
         TRACELENS_EVENT_DNS_QUERY,
         pid,
         fd,
+        protocol,
         (const void *)(unsigned long)ctx->args[1],
         (__u32)ctx->args[2]);
 }
@@ -228,7 +247,7 @@ int tracelens_dns_connect_exit(struct trace_event_raw_sys_exit *ctx)
 
     request = bpf_map_lookup_elem(&pending_connects, &pid_tgid);
     if (request && ctx->ret == 0) {
-        mark_dns_socket(request->pid, request->fd);
+        mark_dns_socket(request->pid, request->fd, TRACELENS_IPPROTO_TCP);
     }
     bpf_map_delete_elem(&pending_connects, &pid_tgid);
     return 0;
@@ -239,16 +258,18 @@ int tracelens_dns_recv_enter(struct trace_event_raw_sys_enter *ctx)
 {
     struct tracelens_socket_key socket_key = {};
     struct tracelens_dns_recv_request request = {};
+    __u16 protocol = 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
 
     socket_key.pid = pid_tgid >> 32;
     socket_key.fd = (__u32)ctx->args[0];
-    if (!bpf_map_lookup_elem(&dns_sockets, &socket_key)) {
+    if (!socket_dns_protocol(socket_key.pid, socket_key.fd, &protocol)) {
         return 0;
     }
 
     request.pid = socket_key.pid;
     request.fd = socket_key.fd;
+    request.protocol = protocol;
     request.buffer = (void *)(unsigned long)ctx->args[1];
     bpf_map_update_elem(&pending_receives, &pid_tgid, &request, BPF_ANY);
     return 0;
@@ -266,6 +287,7 @@ int tracelens_dns_recv_exit(struct trace_event_raw_sys_exit *ctx)
             TRACELENS_EVENT_DNS_RESPONSE,
             request->pid,
             request->fd,
+            request->protocol,
             request->buffer,
             (__u32)ctx->ret);
     }
@@ -277,11 +299,11 @@ SEC("tracepoint/syscalls/sys_enter_sendmsg")
 int tracelens_dns_sendmsg(struct trace_event_raw_sys_enter *ctx)
 {
     struct tracelens_user_msghdr message = {};
-    struct tracelens_socket_key key = {};
     void *buffer = 0;
     void *name = 0;
     __u32 buffer_length = 0;
     __u32 name_length = 0;
+    __u16 protocol = TRACELENS_IPPROTO_UDP;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 fd = (__u32)ctx->args[0];
@@ -292,30 +314,38 @@ int tracelens_dns_sendmsg(struct trace_event_raw_sys_enter *ctx)
             &buffer_length,
             &name,
             &name_length) < 0 ||
-        (!is_dns_destination(name, name_length) && !socket_is_dns(pid, fd))) {
+        (!is_dns_destination(name, name_length) &&
+            !socket_dns_protocol(pid, fd, &protocol))) {
         return 0;
     }
-    mark_dns_socket(pid, fd);
-    return emit_dns_event(TRACELENS_EVENT_DNS_QUERY, pid, fd, buffer, buffer_length);
+    if (is_dns_destination(name, name_length)) {
+        protocol = TRACELENS_IPPROTO_UDP;
+        mark_dns_socket(pid, fd, protocol);
+    }
+    return emit_dns_event(
+        TRACELENS_EVENT_DNS_QUERY,
+        pid,
+        fd,
+        protocol,
+        buffer,
+        buffer_length);
 }
 
 SEC("tracepoint/syscalls/sys_enter_recvmsg")
 int tracelens_dns_recvmsg(struct trace_event_raw_sys_enter *ctx)
 {
     struct tracelens_user_msghdr message = {};
-    struct tracelens_socket_key key = {};
     struct tracelens_dns_recv_request request = {};
     void *buffer = 0;
     void *name = 0;
     __u32 buffer_length = 0;
     __u32 name_length = 0;
+    __u16 protocol = 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 fd = (__u32)ctx->args[0];
 
-    key.pid = pid;
-    key.fd = fd;
-    if (!socket_is_dns(pid, fd) ||
+    if (!socket_dns_protocol(pid, fd, &protocol) ||
         read_message_buffer(
             (const void *)(unsigned long)ctx->args[1],
             &buffer,
@@ -326,6 +356,7 @@ int tracelens_dns_recvmsg(struct trace_event_raw_sys_enter *ctx)
     }
     request.pid = pid;
     request.fd = fd;
+    request.protocol = protocol;
     request.buffer = buffer;
     bpf_map_update_elem(&pending_receives, &pid_tgid, &request, BPF_ANY);
     return 0;
@@ -342,6 +373,7 @@ static __always_inline int finish_dns_receive(struct trace_event_raw_sys_exit *c
             TRACELENS_EVENT_DNS_RESPONSE,
             request->pid,
             request->fd,
+            request->protocol,
             request->buffer,
             (__u32)ctx->ret);
     }
@@ -358,17 +390,19 @@ int tracelens_dns_recvmsg_exit(struct trace_event_raw_sys_exit *ctx)
 SEC("tracepoint/syscalls/sys_enter_write")
 int tracelens_dns_write(struct trace_event_raw_sys_enter *ctx)
 {
+    __u16 protocol = 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 fd = (__u32)ctx->args[0];
 
-    if (!socket_is_dns(pid, fd)) {
+    if (!socket_dns_protocol(pid, fd, &protocol)) {
         return 0;
     }
     return emit_dns_event(
         TRACELENS_EVENT_DNS_QUERY,
         pid,
         fd,
+        protocol,
         (const void *)(unsigned long)ctx->args[1],
         (__u32)ctx->args[2]);
 }
@@ -377,15 +411,17 @@ SEC("tracepoint/syscalls/sys_enter_read")
 int tracelens_dns_read(struct trace_event_raw_sys_enter *ctx)
 {
     struct tracelens_dns_recv_request request = {};
+    __u16 protocol = 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 fd = (__u32)ctx->args[0];
 
-    if (!socket_is_dns(pid, fd)) {
+    if (!socket_dns_protocol(pid, fd, &protocol)) {
         return 0;
     }
     request.pid = pid;
     request.fd = fd;
+    request.protocol = protocol;
     request.buffer = (void *)(unsigned long)ctx->args[1];
     bpf_map_update_elem(&pending_receives, &pid_tgid, &request, BPF_ANY);
     return 0;
@@ -395,6 +431,18 @@ SEC("tracepoint/syscalls/sys_exit_read")
 int tracelens_dns_read_exit(struct trace_event_raw_sys_exit *ctx)
 {
     return finish_dns_receive(ctx);
+}
+
+SEC("tracepoint/syscalls/sys_enter_close")
+int tracelens_dns_close(struct trace_event_raw_sys_enter *ctx)
+{
+    struct tracelens_socket_key key = {};
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    key.pid = pid_tgid >> 32;
+    key.fd = (__u32)ctx->args[0];
+    bpf_map_delete_elem(&dns_sockets, &key);
+    return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

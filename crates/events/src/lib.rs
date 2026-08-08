@@ -88,6 +88,14 @@ pub struct ConnectionRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsEventData {
+    pub protocol: TransportProtocol,
+    pub domain: String,
+    pub addresses: Vec<String>,
+    pub ttl_secs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum EventPayload {
     Empty,
@@ -99,6 +107,7 @@ pub enum EventPayload {
         connection: ConnectionRef,
     },
     Dns {
+        protocol: TransportProtocol,
         domain: String,
         addresses: Vec<String>,
         ttl_secs: u32,
@@ -203,8 +212,29 @@ impl TraceEvent {
         ttl_secs: u32,
         timestamp_ns: u64,
     ) -> Self {
+        Self::dns_event_with_data(
+            source,
+            kind,
+            pid,
+            DnsEventData {
+                protocol: TransportProtocol::Udp,
+                domain: domain.to_owned(),
+                addresses,
+                ttl_secs,
+            },
+            timestamp_ns,
+        )
+    }
+
+    pub fn dns_event_with_data(
+        source: EventSource,
+        kind: EventKind,
+        pid: u32,
+        data: DnsEventData,
+        timestamp_ns: u64,
+    ) -> Self {
         Self {
-            id: format!("dns-{kind:?}-{pid}-{domain}-{timestamp_ns}"),
+            id: format!("dns-{kind:?}-{pid}-{}-{timestamp_ns}", data.domain),
             timestamp_ns,
             source,
             kind,
@@ -212,9 +242,10 @@ impl TraceEvent {
             process: None,
             connection: None,
             payload: EventPayload::Dns {
-                domain: domain.to_owned(),
-                addresses,
-                ttl_secs,
+                protocol: data.protocol,
+                domain: data.domain,
+                addresses: data.addresses,
+                ttl_secs: data.ttl_secs,
             },
         }
     }

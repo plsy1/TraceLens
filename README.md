@@ -6,8 +6,8 @@ escalate selected processes or connections into deeper userspace inspection.
 
 ## Repository status
 
-The repository now contains the Phase 1 application skeleton plus the first
-real Phase 2/3/4 process, connection, and DNS event path:
+The repository now contains the Phase 1 application skeleton plus the real
+Phase 2/3/4 process, connection, DNS, and initial Phase 5 timeline paths:
 
 ```text
 core/           Rust composition root and runtime boundaries
@@ -19,9 +19,9 @@ docs/           product and engineering documentation
 ```
 
 The process, TCP state/byte, and DNS probes emit metadata through BPF ring
-buffers; the Core loader decodes them into process, connection, and DNS read
-models and serves a small read-only local API. Userspace TLS probes, durable
-storage, and detection rules are still placeholders.
+buffers; the Core loader decodes them into process, connection, DNS, and
+timeline read models and serves a small read-only local API. Userspace TLS
+probes, durable storage, and detection rules are still placeholders.
 
 ## Prerequisites
 
@@ -61,10 +61,10 @@ cargo build -p tracelens-core
 sudo ./target/debug/tracelens-core --observe --api-listen 127.0.0.1:8080
 ```
 
-The API exposes /api/health, /api/summary, /api/processes, and
-/api/connections. Start the UI separately with npm run dev; it polls the Core
-API, hides closed connections by default, and falls back to clearly labelled
-demo data when Core is offline.
+The API exposes /api/health, /api/summary, /api/processes, /api/connections,
+and `/api/timeline?limit=50&offset=0&pid=&kind=`. Start the UI separately with
+npm run dev; it polls the Core API, hides closed connections by default, and
+falls back to clearly labelled demo data when Core is offline.
 
 Run the frontend:
 
@@ -77,5 +77,6 @@ npm run dev
 ## Current implementation slice
 
 The observer now correlates process snapshots, TCP byte counters, richer TCP
-states, and DNS query/response answers. The next slices are timeline/history,
-SQLite persistence, detection rules, and userspace TLS inspection.
+states, DNS query/response answers, and resolver-backed domain mappings. The
+first Timeline slice is available in Core/API/UI; the next slices are durable
+history, detection rules, and userspace TLS inspection.
