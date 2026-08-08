@@ -14,6 +14,7 @@ set(TRACELENS_BPF_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/kernel/file.bpf.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/userspace/openssl.bpf.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/userspace/tls.bpf.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/userspace/http.bpf.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/userspace/plaintext.bpf.c"
 )
 

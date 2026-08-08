@@ -6,6 +6,8 @@ deep_inspection_timeout = 300
 preferred_userspace_runtime = "bpftime"
 
 [storage]
+mode = "memory"
+memory_event_limit = 50000
 database = "tracelens.db"
 plaintext_storage = "memory"
 plaintext_max_mb = 50

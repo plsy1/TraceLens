@@ -1,4 +1,7 @@
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, PartialOrd)]
+#[serde(transparent)]
 pub struct RiskScore(pub f32);
 
 impl RiskScore {

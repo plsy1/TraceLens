@@ -6,4 +6,7 @@ mod timeline;
 pub use bus::EventBus;
 pub use correlator::EventCorrelator;
 pub use model::*;
-pub use timeline::{TimelineEntry, TimelineFilter, TimelinePage};
+pub use timeline::{
+    ConnectionTimeline, ConnectionTimelineFilter, ConnectionTimelinePage, TimelineEntry,
+    TimelineFilter, TimelinePage,
+};

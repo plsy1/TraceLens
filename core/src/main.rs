@@ -1,6 +1,7 @@
 use std::env;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex, TryLockError};
 use std::thread;
+use std::time::Duration;
 
 use tracelens_core::{config::CliOptions, Core};
 
@@ -40,9 +41,13 @@ fn print_help() {
          Usage: tracelens-core [OPTIONS]\n\n\
          Options:\n\
            --config <PATH>          Select a configuration file (reserved)\n\
-           --observe                Attach Phase 2/3 kernel probes and serve the local API\n\
+           --observe                Load kernel probes and serve the capture API (starts idle)\n\
            --api-listen <ADDR>      API listen address (default: 127.0.0.1:8080)\n\
            --bpf-object-dir <PATH>  Directory containing compiled BPF objects\n\
+           --storage <MODE>         Event storage: memory (default) or sqlite\n\
+           --database <PATH>        Enable SQLite history at PATH\n\
+           --memory-event-limit N   Maximum events retained in memory (default: 50000)\n\
+           --default-observation-level N  Baseline L1-L5 for all processes (default: 1)\n\
            --print-example-event   Print the shared event schema as JSON\n\
            -h, --help              Show this help\n"
     );
@@ -50,14 +55,35 @@ fn print_help() {
 
 fn run_observer(options: CliOptions) {
     let config = options.config;
-    let core = Arc::new(Mutex::new(Core::new(config.clone())));
+    let capture_gate = Arc::new(AtomicBool::new(false));
+    let core = match Core::open(config.clone()) {
+        Ok(mut core) => {
+            // The observer process starts as an armed tool, not an always-on
+            // dashboard. Kernel tracepoints may be loaded below, but Core
+            // will discard their events until the UI presses Start.
+            core.enable_observer_capture_mode();
+            core.stop_capture();
+            core.set_capture_gate(Arc::clone(&capture_gate));
+            Arc::new(Mutex::new(core))
+        }
+        Err(error) => {
+            eprintln!("failed to initialize TraceLens storage: {error}");
+            return;
+        }
+    };
     let (sender, receiver) = mpsc::channel();
+
+    if let Ok(mut core) = core.lock() {
+        core.set_probe_event_sender(sender.clone());
+    }
 
     let observer_config = config.clone();
     thread::spawn(move || {
-        if let Err(error) =
-            tracelens_core::runtime::kernel::KernelRuntime::run(&observer_config, sender)
-        {
+        if let Err(error) = tracelens_core::runtime::kernel::KernelRuntime::run(
+            &observer_config,
+            sender,
+            capture_gate,
+        ) {
             eprintln!("kernel observer stopped: {error}");
         }
     });
@@ -74,9 +100,23 @@ fn run_observer(options: CliOptions) {
     println!("BPF object directory: {}", config.bpf_object_dir.display());
     println!("API: http://{api_listen}");
 
-    for event in receiver {
-        if let Ok(mut core) = core.lock() {
-            core.ingest_event(event);
+    const EVENT_BATCH_LIMIT: usize = 256;
+    while let Ok(first_event) = receiver.recv() {
+        let mut events = Vec::with_capacity(EVENT_BATCH_LIMIT);
+        events.push(first_event);
+        events.extend(receiver.try_iter().take(EVENT_BATCH_LIMIT - 1));
+        let core_guard = loop {
+            match core.try_lock() {
+                Ok(core) => break Some(core),
+                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+                Err(TryLockError::Poisoned(_)) => break None,
+            }
+        };
+        if let Some(mut core) = core_guard {
+            for event in events {
+                core.ingest_event(event);
+            }
         }
+        thread::yield_now();
     }
 }

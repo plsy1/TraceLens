@@ -13,6 +13,14 @@
 #define TRACELENS_EVENT_PLAINTEXT 8
 #define TRACELENS_EVENT_TCP_STATE 9
 #define TRACELENS_EVENT_TCP_BYTES 10
+#define TRACELENS_EVENT_HTTP_CAPTURE 11
+#define TRACELENS_EVENT_FILE_OPEN 12
+#define TRACELENS_EVENT_FILE_READ 13
+
+#define TRACELENS_TLS_METADATA_HANDSHAKE 1
+#define TRACELENS_TLS_METADATA_SNI 2
+#define TRACELENS_TLS_METADATA_VERSION 3
+#define TRACELENS_TLS_METADATA_FD 4
 
 #define TRACELENS_AF_INET 2
 #define TRACELENS_AF_INET6 10
@@ -21,6 +29,13 @@
 #define TRACELENS_COMM_LEN 16
 #define TRACELENS_ADDR_LEN 16
 #define TRACELENS_DNS_PAYLOAD_LEN 512
+#define TRACELENS_TLS_NAME_LEN 128
+#define TRACELENS_TLS_VERSION_LEN 32
+#define TRACELENS_PLAINTEXT_READ 1
+#define TRACELENS_PLAINTEXT_WRITE 2
+/* Keep ordinary HTML/JSON responses in one bounded SSL capture event. */
+#define TRACELENS_PLAINTEXT_MAX_LEN (16 * 1024)
+#define TRACELENS_FILE_PATH_LEN 256
 
 struct tracelens_process_event {
     __u16 event_type;
@@ -59,11 +74,48 @@ struct tracelens_dns_event {
 };
 
 struct tracelens_tls_event {
+    __u16 event_type;
+    __u16 metadata_kind;
     __u32 pid;
     __u64 timestamp_ns;
     __u64 ssl_object;
+    __s32 fd;
+    __u32 reserved;
+    char sni[TRACELENS_TLS_NAME_LEN];
+    char version[TRACELENS_TLS_VERSION_LEN];
+};
+
+struct tracelens_plaintext_event {
     __u16 event_type;
-    __u16 payload_size;
+    __u16 direction;
+    __u32 pid;
+    __u64 timestamp_ns;
+    __u64 ssl_object;
+    __s32 fd;
+    __u32 payload_size;
+    __u32 truncated;
+    __u8 payload[TRACELENS_PLAINTEXT_MAX_LEN];
+};
+
+struct tracelens_http_capture_event {
+    __u16 event_type;
+    __u16 direction;
+    __u32 pid;
+    __u64 timestamp_ns;
+    __u64 ssl_object;
+    __s32 fd;
+    __u32 payload_size;
+    __u32 truncated;
+    __u8 payload[TRACELENS_PLAINTEXT_MAX_LEN];
+};
+
+struct tracelens_file_event {
+    __u16 event_type;
+    __u16 reserved;
+    __u32 pid;
+    __u64 timestamp_ns;
+    __u64 bytes;
+    char path[TRACELENS_FILE_PATH_LEN];
 };
 
 #endif

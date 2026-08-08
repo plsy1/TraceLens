@@ -2,10 +2,19 @@ use std::path::PathBuf;
 
 use crate::observation::ObservationLevel;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StorageMode {
+    #[default]
+    Memory,
+    Sqlite,
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
     pub default_observation_level: ObservationLevel,
     pub deep_inspection_timeout_secs: u64,
+    pub storage: StorageMode,
+    pub memory_event_limit: usize,
     pub database: PathBuf,
     pub bpf_object_dir: PathBuf,
     pub preferred_userspace_runtime: String,
@@ -17,6 +26,8 @@ impl Default for CoreConfig {
         Self {
             default_observation_level: ObservationLevel::L1,
             deep_inspection_timeout_secs: 300,
+            storage: StorageMode::Memory,
+            memory_event_limit: 50_000,
             database: PathBuf::from("tracelens.db"),
             bpf_object_dir: PathBuf::from("build/bpf/objects"),
             preferred_userspace_runtime: "bpftime".to_owned(),
@@ -72,6 +83,57 @@ impl CliOptions {
                         config.bpf_object_dir = PathBuf::from(value);
                     } else {
                         eprintln!("warning: --bpf-object-dir requires a path");
+                    }
+                }
+                "--storage" => {
+                    if let Some(value) = args.next() {
+                        match value.as_str() {
+                            "memory" => config.storage = StorageMode::Memory,
+                            "sqlite" => config.storage = StorageMode::Sqlite,
+                            _ => eprintln!(
+                                "warning: invalid storage `{value}`; use `memory` or `sqlite`"
+                            ),
+                        }
+                    } else {
+                        eprintln!("warning: --storage requires memory or sqlite");
+                    }
+                }
+                "--database" => {
+                    if let Some(value) = args.next() {
+                        config.database = PathBuf::from(value);
+                        config.storage = StorageMode::Sqlite;
+                    } else {
+                        eprintln!("warning: --database requires a path");
+                    }
+                }
+                "--memory-event-limit" => {
+                    if let Some(value) = args.next() {
+                        match value.parse::<usize>() {
+                            Ok(limit) if limit > 0 => config.memory_event_limit = limit,
+                            _ => eprintln!(
+                                "warning: --memory-event-limit requires a positive integer"
+                            ),
+                        }
+                    } else {
+                        eprintln!("warning: --memory-event-limit requires a positive integer");
+                    }
+                }
+                "--default-observation-level" => {
+                    if let Some(value) = args.next() {
+                        match value
+                            .parse::<u8>()
+                            .ok()
+                            .and_then(ObservationLevel::from_number)
+                        {
+                            Some(level) => config.default_observation_level = level,
+                            None => eprintln!(
+                                "warning: --default-observation-level requires a value from 1 to 5"
+                            ),
+                        }
+                    } else {
+                        eprintln!(
+                            "warning: --default-observation-level requires a value from 1 to 5"
+                        );
                     }
                 }
                 "--observe" => observe = true,

@@ -1,16 +1,23 @@
 //! Kernel eBPF runtime and ring-buffer event decoder.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
-use std::sync::mpsc::Sender;
+use std::rc::Rc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::Sender,
+    Arc,
+};
 use std::time::Duration;
 use std::{net::IpAddr, net::Ipv4Addr, net::Ipv6Addr};
 
 use libbpf_rs::{Link, MapCore, Object, ObjectBuilder, RingBufferBuilder};
 use tracelens_events::{
-    ConnectionRef, ConnectionState, DnsEventData, Endpoint, EventKind, EventSource, ProcessRef,
-    TcpState, TraceEvent, TransportProtocol,
+    ConnectionRef, ConnectionState, DnsEventData, Endpoint, EventKind, EventSource, FileEventData,
+    ProcessRef, TcpState, TraceEvent, TransportProtocol,
 };
 
 use crate::config::CoreConfig;
@@ -23,6 +30,8 @@ const EVENT_DNS_QUERY: u16 = 5;
 const EVENT_DNS_RESPONSE: u16 = 6;
 const EVENT_TCP_STATE: u16 = 9;
 const EVENT_TCP_BYTES: u16 = 10;
+const EVENT_FILE_OPEN: u16 = 12;
+const EVENT_FILE_READ: u16 = 13;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 const IPPROTO_TCP: u16 = 6;
@@ -30,6 +39,7 @@ const IPPROTO_UDP: u16 = 17;
 const COMM_LEN: usize = 16;
 const ADDR_LEN: usize = 16;
 const DNS_PAYLOAD_LEN: usize = 512;
+const FILE_PATH_LEN: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -73,6 +83,17 @@ struct KernelDnsEvent {
     payload: [u8; DNS_PAYLOAD_LEN],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelFileEvent {
+    event_type: u16,
+    _reserved: u16,
+    pid: u32,
+    timestamp_ns: u64,
+    bytes: u64,
+    path: [u8; FILE_PATH_LEN],
+}
+
 #[derive(Debug, Default)]
 pub struct KernelRuntime {
     attached: bool,
@@ -92,17 +113,24 @@ impl KernelRuntime {
     }
 
     /// Load the process/network/DNS objects, attach their tracepoints, and forward events.
-    pub fn run(config: &CoreConfig, sender: Sender<TraceEvent>) -> Result<(), String> {
+    pub fn run(
+        config: &CoreConfig,
+        sender: Sender<TraceEvent>,
+        capture_gate: Arc<AtomicBool>,
+    ) -> Result<(), String> {
         let process_path = config.bpf_object_dir.join("process.o");
         let network_path = config.bpf_object_dir.join("network.o");
         let dns_path = config.bpf_object_dir.join("dns.o");
+        let file_path = config.bpf_object_dir.join("file.o");
         ensure_object_exists(&process_path)?;
         ensure_object_exists(&network_path)?;
         ensure_object_exists(&dns_path)?;
+        ensure_object_exists(&file_path)?;
 
         let mut process_object = load_object(&process_path)?;
         let mut network_object = load_object(&network_path)?;
         let mut dns_object = load_object(&dns_path)?;
+        let mut file_object = load_object(&file_path)?;
 
         let _process_exec_link = attach_program(&mut process_object, "tracelens_process_exec")?;
         let _process_exit_link = attach_program(&mut process_object, "tracelens_process_exit")?;
@@ -135,18 +163,32 @@ impl KernelRuntime {
         let _dns_read_link = attach_program(&mut dns_object, "tracelens_dns_read")?;
         let _dns_read_exit_link = attach_program(&mut dns_object, "tracelens_dns_read_exit")?;
         let _dns_close_link = attach_program(&mut dns_object, "tracelens_dns_close")?;
+        let _file_open_link = attach_program(&mut file_object, "tracelens_file_open")?;
 
         let process_events = find_map(&process_object, "events")?;
         let network_events = find_map(&network_object, "events")?;
         let dns_events = find_map(&dns_object, "events")?;
+        let file_events = find_map(&file_object, "events")?;
         let process_sender = sender.clone();
         let network_sender = sender.clone();
         let dns_sender = sender;
+        let file_sender = dns_sender.clone();
+        let process_cache = Rc::new(RefCell::new(HashMap::<u32, ProcessRef>::new()));
+        let process_cache_for_process = Rc::clone(&process_cache);
+        let process_cache_for_network = Rc::clone(&process_cache);
+        let process_gate = Arc::clone(&capture_gate);
+        let network_gate = Arc::clone(&capture_gate);
+        let dns_gate = Arc::clone(&capture_gate);
+        let file_gate = capture_gate;
 
         let mut ring_buffer_builder = RingBufferBuilder::new();
         ring_buffer_builder
             .add(&process_events, move |data| {
+                if !process_gate.load(Ordering::Acquire) {
+                    return 0;
+                }
                 if let Some(event) = decode_process_event(data) {
+                    update_process_cache(&process_cache_for_process, &event);
                     let _ = process_sender.send(event);
                 }
                 0
@@ -154,7 +196,10 @@ impl KernelRuntime {
             .map_err(|error| format!("failed to register process ring buffer: {error}"))?;
         ring_buffer_builder
             .add(&network_events, move |data| {
-                if let Some(event) = decode_network_event(data) {
+                if !network_gate.load(Ordering::Acquire) {
+                    return 0;
+                }
+                if let Some(event) = decode_network_event(data, &process_cache_for_network) {
                     let _ = network_sender.send(event);
                 }
                 0
@@ -162,12 +207,26 @@ impl KernelRuntime {
             .map_err(|error| format!("failed to register network ring buffer: {error}"))?;
         ring_buffer_builder
             .add(&dns_events, move |data| {
+                if !dns_gate.load(Ordering::Acquire) {
+                    return 0;
+                }
                 if let Some(event) = decode_dns_event(data) {
                     let _ = dns_sender.send(event);
                 }
                 0
             })
             .map_err(|error| format!("failed to register DNS ring buffer: {error}"))?;
+        ring_buffer_builder
+            .add(&file_events, move |data| {
+                if !file_gate.load(Ordering::Acquire) {
+                    return 0;
+                }
+                if let Some(event) = decode_file_event(data) {
+                    let _ = file_sender.send(event);
+                }
+                0
+            })
+            .map_err(|error| format!("failed to register file ring buffer: {error}"))?;
 
         let ring_buffer = ring_buffer_builder
             .build()
@@ -175,7 +234,10 @@ impl KernelRuntime {
 
         loop {
             ring_buffer
-                .poll(Duration::from_millis(500))
+                // Process-name capture must react to ProcessExec quickly:
+                // otherwise a short-lived TLS client can finish its first
+                // SSL_read before Core has a chance to attach user probes.
+                .poll(Duration::from_millis(10))
                 .map_err(|error| format!("kernel ring buffer stopped: {error}"))?;
         }
     }
@@ -248,7 +310,10 @@ fn decode_process_event(data: &[u8]) -> Option<TraceEvent> {
     ))
 }
 
-fn decode_network_event(data: &[u8]) -> Option<TraceEvent> {
+fn decode_network_event(
+    data: &[u8],
+    process_cache: &RefCell<HashMap<u32, ProcessRef>>,
+) -> Option<TraceEvent> {
     let event = read_unaligned::<KernelNetworkEvent>(data)?;
     let remote_address = decode_address(event.family, event.remote_addr)?;
     let local_address = decode_address(event.family, event.local_addr);
@@ -300,10 +365,42 @@ fn decode_network_event(data: &[u8]) -> Option<TraceEvent> {
         EventSource::Kernel,
         kind,
         event.pid,
-        read_process_ref(event.pid, event.timestamp_ns),
+        process_ref_for_pid(process_cache, event.pid, event.timestamp_ns),
         connection,
         event.timestamp_ns,
     ))
+}
+
+fn process_ref_for_pid(
+    process_cache: &RefCell<HashMap<u32, ProcessRef>>,
+    pid: u32,
+    timestamp_ns: u64,
+) -> Option<ProcessRef> {
+    if let Some(process) = process_cache.borrow().get(&pid).cloned() {
+        return Some(process);
+    }
+    let process = read_process_ref(pid, timestamp_ns);
+    if let Some(process) = process.clone() {
+        process_cache.borrow_mut().insert(pid, process);
+    }
+    process
+}
+
+fn update_process_cache(process_cache: &RefCell<HashMap<u32, ProcessRef>>, event: &TraceEvent) {
+    let Some(pid) = event.pid else {
+        return;
+    };
+    match &event.kind {
+        EventKind::ProcessExec => {
+            if let Some(process) = event.process.clone() {
+                process_cache.borrow_mut().insert(pid, process);
+            }
+        }
+        EventKind::ProcessExit => {
+            process_cache.borrow_mut().remove(&pid);
+        }
+        _ => {}
+    }
 }
 
 fn decode_dns_event(data: &[u8]) -> Option<TraceEvent> {
@@ -337,6 +434,29 @@ fn decode_dns_event(data: &[u8]) -> Option<TraceEvent> {
             domain: dns.domain,
             addresses: dns.addresses,
             ttl_secs: dns.ttl_secs,
+        },
+        event.timestamp_ns,
+    ))
+}
+
+fn decode_file_event(data: &[u8]) -> Option<TraceEvent> {
+    let event = read_unaligned::<KernelFileEvent>(data)?;
+    if event.pid == 0 {
+        return None;
+    }
+    let path = bytes_to_string(&event.path)?;
+    let kind = match event.event_type {
+        EVENT_FILE_OPEN => EventKind::FileOpen,
+        EVENT_FILE_READ => EventKind::FileRead,
+        _ => return None,
+    };
+    Some(TraceEvent::file_event(
+        EventSource::Kernel,
+        kind,
+        event.pid,
+        FileEventData {
+            path,
+            bytes: event.bytes,
         },
         event.timestamp_ns,
     ))
