@@ -191,6 +191,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracelens-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "tracelens-core",
+ "tracelens-events",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"

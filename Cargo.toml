@@ -2,6 +2,7 @@
 members = [
     "core",
     "crates/events",
+    "tests",
 ]
 resolver = "2"
 

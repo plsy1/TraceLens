@@ -1,5 +1,14 @@
 # Integration tests
 
-End-to-end tests will live here once the core can attach the first kernel
-probes. The first acceptance test is expected to launch `curl`, observe its
-process and TCP connection, and verify the DNS correlation path.
+The `telemetry_flow` integration test exercises the core pipeline without
+requiring root privileges or a live kernel probe:
+
+```text
+ProcessExec → DNS Response → TCP Connect → TCP State → TCP Bytes → TCP Close
+```
+
+It verifies process snapshots, FakeIP/domain correlation, TCP state and byte
+aggregation, TTL expiry, and closed-connection history after process exit.
+
+The future privileged acceptance test will launch `curl` against the real
+observer and verify the kernel probe/API path end to end.

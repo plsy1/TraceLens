@@ -43,7 +43,7 @@ Check the Rust workspace:
 
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace
+cargo test --workspace --all-targets
 ```
 
 Configure and compile the probe layer:
