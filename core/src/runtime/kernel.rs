@@ -9,8 +9,8 @@ use std::{net::IpAddr, net::Ipv4Addr, net::Ipv6Addr};
 
 use libbpf_rs::{Link, MapCore, Object, ObjectBuilder, RingBufferBuilder};
 use tracelens_events::{
-    ConnectionRef, ConnectionState, DnsEventData, Endpoint, EventKind, EventSource, ProcessRef,
-    TcpState, TraceEvent, TransportProtocol,
+    ConnectionRef, ConnectionState, DnsEventData, Endpoint, EventKind, EventSource, FileEventData,
+    ProcessRef, TcpState, TraceEvent, TransportProtocol,
 };
 
 use crate::config::CoreConfig;
@@ -23,6 +23,8 @@ const EVENT_DNS_QUERY: u16 = 5;
 const EVENT_DNS_RESPONSE: u16 = 6;
 const EVENT_TCP_STATE: u16 = 9;
 const EVENT_TCP_BYTES: u16 = 10;
+const EVENT_FILE_OPEN: u16 = 12;
+const EVENT_FILE_READ: u16 = 13;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 const IPPROTO_TCP: u16 = 6;
@@ -30,6 +32,7 @@ const IPPROTO_UDP: u16 = 17;
 const COMM_LEN: usize = 16;
 const ADDR_LEN: usize = 16;
 const DNS_PAYLOAD_LEN: usize = 512;
+const FILE_PATH_LEN: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -73,6 +76,17 @@ struct KernelDnsEvent {
     payload: [u8; DNS_PAYLOAD_LEN],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelFileEvent {
+    event_type: u16,
+    _reserved: u16,
+    pid: u32,
+    timestamp_ns: u64,
+    bytes: u64,
+    path: [u8; FILE_PATH_LEN],
+}
+
 #[derive(Debug, Default)]
 pub struct KernelRuntime {
     attached: bool,
@@ -96,13 +110,16 @@ impl KernelRuntime {
         let process_path = config.bpf_object_dir.join("process.o");
         let network_path = config.bpf_object_dir.join("network.o");
         let dns_path = config.bpf_object_dir.join("dns.o");
+        let file_path = config.bpf_object_dir.join("file.o");
         ensure_object_exists(&process_path)?;
         ensure_object_exists(&network_path)?;
         ensure_object_exists(&dns_path)?;
+        ensure_object_exists(&file_path)?;
 
         let mut process_object = load_object(&process_path)?;
         let mut network_object = load_object(&network_path)?;
         let mut dns_object = load_object(&dns_path)?;
+        let mut file_object = load_object(&file_path)?;
 
         let _process_exec_link = attach_program(&mut process_object, "tracelens_process_exec")?;
         let _process_exit_link = attach_program(&mut process_object, "tracelens_process_exit")?;
@@ -135,13 +152,16 @@ impl KernelRuntime {
         let _dns_read_link = attach_program(&mut dns_object, "tracelens_dns_read")?;
         let _dns_read_exit_link = attach_program(&mut dns_object, "tracelens_dns_read_exit")?;
         let _dns_close_link = attach_program(&mut dns_object, "tracelens_dns_close")?;
+        let _file_open_link = attach_program(&mut file_object, "tracelens_file_open")?;
 
         let process_events = find_map(&process_object, "events")?;
         let network_events = find_map(&network_object, "events")?;
         let dns_events = find_map(&dns_object, "events")?;
+        let file_events = find_map(&file_object, "events")?;
         let process_sender = sender.clone();
         let network_sender = sender.clone();
         let dns_sender = sender;
+        let file_sender = dns_sender.clone();
 
         let mut ring_buffer_builder = RingBufferBuilder::new();
         ring_buffer_builder
@@ -168,6 +188,14 @@ impl KernelRuntime {
                 0
             })
             .map_err(|error| format!("failed to register DNS ring buffer: {error}"))?;
+        ring_buffer_builder
+            .add(&file_events, move |data| {
+                if let Some(event) = decode_file_event(data) {
+                    let _ = file_sender.send(event);
+                }
+                0
+            })
+            .map_err(|error| format!("failed to register file ring buffer: {error}"))?;
 
         let ring_buffer = ring_buffer_builder
             .build()
@@ -337,6 +365,29 @@ fn decode_dns_event(data: &[u8]) -> Option<TraceEvent> {
             domain: dns.domain,
             addresses: dns.addresses,
             ttl_secs: dns.ttl_secs,
+        },
+        event.timestamp_ns,
+    ))
+}
+
+fn decode_file_event(data: &[u8]) -> Option<TraceEvent> {
+    let event = read_unaligned::<KernelFileEvent>(data)?;
+    if event.pid == 0 {
+        return None;
+    }
+    let path = bytes_to_string(&event.path)?;
+    let kind = match event.event_type {
+        EVENT_FILE_OPEN => EventKind::FileOpen,
+        EVENT_FILE_READ => EventKind::FileRead,
+        _ => return None,
+    };
+    Some(TraceEvent::file_event(
+        EventSource::Kernel,
+        kind,
+        event.pid,
+        FileEventData {
+            path,
+            bytes: event.bytes,
         },
         event.timestamp_ns,
     ))

@@ -7,7 +7,8 @@ escalate selected processes or connections into deeper userspace inspection.
 ## Repository status
 
 The repository now contains the Phase 1 application skeleton plus the real
-Phase 2/3/4 process, connection, DNS, and initial Phase 5 timeline paths:
+Phase 2-12 process, connection, DNS, inspection, detection, and behavior graph
+paths:
 
 ```text
 core/           Rust composition root and runtime boundaries
@@ -20,8 +21,27 @@ docs/           product and engineering documentation
 
 The process, TCP state/byte, and DNS probes emit metadata through BPF ring
 buffers; the Core loader decodes them into process, connection, DNS, and
-timeline read models and serves a small read-only local API. Userspace TLS
-probes, durable storage, and detection rules are still placeholders.
+timeline read models and serves a local API. Recent events stay in a bounded
+in-memory store by default; SQLite history is opt-in. Connection activity is
+grouped into session cards, and Observation Manager controls L1-L5 Probe
+dependencies. The Phase 7 runtime adapter now includes a real `bpftime trace`
+loader path (`tracelens-bpftime-loader`) and a libbpf-backed kernel-uProbe
+path. It resolves the target process ELF and loaded libssl mapping, keeps real
+link/process handles for detach, and reports attach failures through
+`/api/health`. Phase 8 adds OpenSSL TLS metadata events through the userspace
+ring buffer: SNI, negotiated version, SSL object/fd, and connection correlation
+are visible in Timeline and connection sessions. Phase 9 adds on-demand L5
+`SSL_read`/`SSL_write` capture: each plaintext event is capped at 512 bytes,
+keeps its original byte count/truncation flag, and is correlated through the
+SSL object into the connection Timeline. L1-L3 never collect payload bytes.
+Phase 10 adds a bounded L4 HTTP capture path for OpenSSL traffic: Core
+reassembles HTTP/1.1 requests and responses, exposes method/host/path/status/
+headers as metadata, and drops the raw L4 capture after parsing. L5 continues
+to expose the separate bounded plaintext stream. Phase 11 adds an in-memory
+rule engine for beacon, scan, lateral movement, suspicious upload, first-seen
+domain, and sensitive-file correlation alerts. Phase 12 adds a derived
+`/api/graph` behavior graph for processes, connections, domains, and retained
+sensitive-file events. Alert and graph state are runtime-only by default.
 
 ## Prerequisites
 
@@ -62,9 +82,11 @@ sudo ./target/debug/tracelens-core --observe --api-listen 127.0.0.1:8080
 ```
 
 The API exposes /api/health, /api/summary, /api/processes, /api/connections,
-and `/api/timeline?limit=50&offset=0&pid=&kind=`. Start the UI separately with
-npm run dev; it polls the Core API, hides closed connections by default, and
-falls back to clearly labelled demo data when Core is offline.
+`/api/timeline`, `/api/connection-timeline`, `/api/alerts`, and `/api/graph`.
+The UI loads connection
+session summaries first and fetches up to 200 child events only when a session
+is expanded; it hides closed connections by default and falls back to clearly
+labelled demo data when Core is offline.
 
 Run the frontend:
 
@@ -78,5 +100,6 @@ npm run dev
 
 The observer now correlates process snapshots, TCP byte counters, richer TCP
 states, DNS query/response answers, and resolver-backed domain mappings. The
-first Timeline slice is available in Core/API/UI; the next slices are durable
-history, detection rules, and userspace TLS inspection.
+current slice includes connection-oriented Timeline UX, optional durable
+history, TLS metadata inspection, bounded L4 HTTP metadata inspection, bounded
+L5 plaintext inspection, and the real userspace runtime loading boundary.

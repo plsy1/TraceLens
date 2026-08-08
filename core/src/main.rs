@@ -43,6 +43,9 @@ fn print_help() {
            --observe                Attach Phase 2/3 kernel probes and serve the local API\n\
            --api-listen <ADDR>      API listen address (default: 127.0.0.1:8080)\n\
            --bpf-object-dir <PATH>  Directory containing compiled BPF objects\n\
+           --storage <MODE>         Event storage: memory (default) or sqlite\n\
+           --database <PATH>        Enable SQLite history at PATH\n\
+           --memory-event-limit N   Maximum events retained in memory (default: 50000)\n\
            --print-example-event   Print the shared event schema as JSON\n\
            -h, --help              Show this help\n"
     );
@@ -50,8 +53,18 @@ fn print_help() {
 
 fn run_observer(options: CliOptions) {
     let config = options.config;
-    let core = Arc::new(Mutex::new(Core::new(config.clone())));
+    let core = match Core::open(config.clone()) {
+        Ok(core) => Arc::new(Mutex::new(core)),
+        Err(error) => {
+            eprintln!("failed to initialize TraceLens storage: {error}");
+            return;
+        }
+    };
     let (sender, receiver) = mpsc::channel();
+
+    if let Ok(mut core) = core.lock() {
+        core.set_probe_event_sender(sender.clone());
+    }
 
     let observer_config = config.clone();
     thread::spawn(move || {

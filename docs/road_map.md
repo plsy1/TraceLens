@@ -8,8 +8,13 @@
 - Phase 2 初版：已实现进程 exec/exit eBPF 事件、`/proc` 元数据补全、Rust 进程 Tracker 和只读 API。
 - Phase 3：已实现 IPv4/IPv6 connect/close、PID/FD 关联、上传/下载字节计数、TCP 状态事件、进程快照和 UI 连接表；closed 历史连接支持勾选显示。
 - Phase 4：已实现 UDP/TCP DNS query/response、A/AAAA 解析、TTL/负响应缓存、FD 清理、进程优先和 resolver 全局兜底的连接域名关联。
-- Phase 5 初版：已实现 Process/DNS/Network 统一 Timeline、`/api/timeline` 和 UI 时间线。
-- 后续待补：连接失败原因、更完整的入站连接覆盖、Timeline 持久化、域名事务级消歧和 privileged eBPF E2E 测试。
+- Phase 5：已实现 Process/DNS/Network 统一 Timeline、默认内存事件缓存、可选 SQLite 历史、连接会话聚合、`/api/timeline`、PID/事件类型/连接筛选和 UI 时间线。
+- Phase 6 初版：已实现目标级观测会话、L1-L5 升级/降级、超时回收、观测命令 API 和进程观测等级控件。
+- Phase 7：已实现 bpftime CLI/loader 适配、目标 ELF/libssl 解析、真实 libbpf kernel uProbe fallback、attach/detach 生命周期和失败状态 API；本机尚未安装 bpftime，因此官方 runtime 路径仍需在具备 bpftime 的环境做 privileged E2E 验证。
+- Phase 8：已实现 OpenSSL TLS 元数据采集、SNI/version/SSL object/fd 缓存、连接关联和 Timeline/UI 展示。
+- Phase 9：已实现 L5 按需 `SSL_read`/`SSL_write` 明文片段采集、SSL object 关联、512 B 单事件上限、Timeline/UI 展示和测试覆盖。
+- Phase 10：已实现独立 L4 HTTP capture、双向流重组、HTTP/1.1 请求/响应解析、Content-Length/chunked framing、HTTP 元数据事件、Timeline/API/UI 展示和测试覆盖。
+- 后续待补：TLS 连接失败原因、更完整的入站连接覆盖、域名事务级消歧、HTTP 事件和 privileged eBPF/bpftime E2E 测试。
 
 当前验收方式：启动 observer 后运行 `curl https://example.com`，在 dashboard 中查看真实进程、域名、TCP 状态和流量元数据。
 
@@ -2224,93 +2229,127 @@ python
 
 ## Phase 5：Timeline
 
-当前已完成初版：
+当前已完成：
 
 - Core 按 timestamp 聚合 Process、Network、DNS 事件
 - TimelineEntry 统一读模型
-- `/api/timeline?limit=50&offset=0&pid=&kind=` 只读接口
-- PID/事件类型过滤和向更早事件翻页
+- 可选 SQLite `timeline_events` 持久化和启动时历史恢复
+- `/api/timeline?limit=50&offset=0&pid=&kind=&connection_id=` 只读接口
+- PID、事件类型、连接 ID 过滤和向更早事件翻页
+- `/api/connection-timeline` 连接会话聚合接口
+- 连接 canonical ID、DNS 上下文、TCP 状态和流量事件聚合
+- UI Sessions 会话卡片、固定高度内部滚动和分页、摘要优先加载、按展开动作加载最多 200 条事件、duration/上传下载摘要和跳转连接
+- Raw events 高级排查视图
 - UI Timeline 筛选器、事件总数和 Load older 交互
 
-后续补充：持久化历史查询和按连接 ID 过滤。
+后续补充：更细粒度的历史保留策略和按时间范围查询。
 
 ---
 
 ## Phase 6：Observation Manager
 
-实现：
+当前已完成：
 
-```text
-L1
+- 默认 L1 观测等级
+- Process、Connection、Domain 目标
+- 目标级 L1-L5 升级
+- 降级回默认等级
+- 可选超时和过期回收
+- `GET /api/observations`
+- `POST /api/observations`
+- `DELETE /api/observations?target=...`
+- Processes UI 观测等级控件
 
-upgrade
+仍需补充：
 
-downgrade
-
-timeout
-```
+- 在真实 TLS/HTTP/明文事件接入后补充按等级的有效载荷策略
 
 ---
 
 ## Phase 7：bpftime Integration
 
-实现：
+当前已完成初版：
 
-- detect bpftime
-- runtime interface
-- attach userspace eBPF
-- detach
-- runtime fallback
+- 探测 `bpftime` 命令或 `TRACELENS_BPFTIME` 指定路径
+- `ProbeKind` 和 L3/L4/L5 Probe dependency resolution
+- 目标级 userspace Probe attach/detach 控制接口
+- 无 bpftime 时自动选择真实 libbpf kernel uProbe fallback
+- `tracelens-bpftime-loader` 使用标准 libbpf object/uprobe API，由 `bpftime trace` 负责 userspace runtime 注入
+- 根据 `/proc/<pid>/exe` 和 `/proc/<pid>/maps` 解析目标 ELF/libssl 路径
+- 保留 bpftime loader 子进程、libbpf Object/Link，降级和 detach 会实际释放资源
+- `/api/health` 暴露 runtime、PID/Hook 级 attached probes 和 `probe_errors`
+
+仍需补充：
+
+- 在安装 bpftime 的 Linux 主机上完成 `bpftime trace` privileged E2E 验证
 
 ---
 
 ## Phase 8：OpenSSL Metadata
 
-实现：
+当前已完成：
 
-- libssl detection
-- TLS SNI
-- TLS version
-- connection correlation
+- libssl detection 和目标进程级 uProbe attach
+- `SSL_connect`、`SSL_get_servername`、`SSL_get_version`、`SSL_get_fd`、`SSL_set_fd` 元数据事件
+- userspace BPF ring buffer 消费和共享 TLS 事件 ABI
+- TLS SNI、TLS version、SSL object、fd 运行时缓存
+- fd → `socket-<pid/fd>` 连接关联
+- Timeline、connection-timeline、connections API 和 UI 展示
+- 进程退出时自动释放对应 userspace probes
 
 完成：
 
 L3
 
+仍需补充：
+
+- 在更多 OpenSSL 版本、静态链接/非 OpenSSL TLS 库和 bpftime runtime 上做兼容性 E2E
+
 ---
 
-## Phase 9：TLS Plaintext
+## Phase 9：TLS Plaintext（已完成）
 
 实现：
 
 - SSL_read
 - SSL_write
-- buffer collection
-- SSL object correlation
-- plaintext UI
+- 入口/返回点配对，保证 `SSL_read` 在返回后读取实际 buffer
+- 有界 buffer collection：单条事件最多 512 B，保留原始字节数和截断标记
+- SSL object → TLS session → socket/connection correlation
+- Timeline、连接详情和事件类型筛选中的 plaintext UI
+- 默认只在 L5 目标上挂载，L1-L3 不采集 payload
 
 完成：
 
 L5
 
+默认事件仍保存在内存事件缓存中；只有用户显式选择 SQLite 历史时才沿用持久化存储配置。启用明文观测前应确认目标和数据处理边界。
+
 ---
 
-## Phase 10：HTTP/1.1
+## Phase 10：HTTP/1.1（已完成）
 
 实现：
 
-- stream reassembly
-- request parser
-- response parser
-- method
-- host
-- path
-- status
-- headers
+- 独立 L4 OpenSSL `SSL_read`/`SSL_write` bounded capture object
+- request/response 双向 stream reassembly
+- HTTP/1.1 request line、method、target/path、Host 解析
+- response status/reason 解析
+- headers、Content-Length 和 chunked body framing
+- Core 只保存解析后的 `Http` 元数据事件，原始 L4 capture 立即丢弃
+- Timeline、连接详情、事件类型筛选和 HTTP 元数据展示
+
+边界：当前 L4 runtime path 面向 OpenSSL/TLS 连接；普通明文 HTTP
+进程仍可在 L5 plaintext path 中被解析，非 OpenSSL 用户态库的 HTTP
+capture 适配放到后续 runtime 兼容性工作。
+
+完成：
+
+L4（HTTP metadata）
 
 ---
 
-## Phase 11：Detection
+## Phase 11：Detection（第一版已完成）
 
 实现：
 
@@ -2321,9 +2360,11 @@ L5
 - new domain
 - sensitive file + network correlation
 
+当前实现使用内存状态窗口和去重后的规则告警：beacon、scan、横向移动、异常上传、首次域名、敏感文件后网络访问/上传均会生成带证据和风险分的 Alert。默认不写入 SQLite；敏感文件事件由 always-on `openat` 探针产生，普通文件打开事件不会进入默认事件缓存。
+
 ---
 
-## Phase 12：Behavior Graph
+## Phase 12：Behavior Graph（第一版已完成）
 
 加入：
 
@@ -2333,6 +2374,8 @@ Connection
 File
 
 关系图。
+
+Core 提供 `/api/graph` 派生接口，WebUI 以固定高度 SVG 展示 Process、Connection、Domain、File 节点和关系边。图数据从内存 read model 重建，不额外引入持久化数据库；点击节点可以回到对应的时间线或连接详情。
 
 ---
 

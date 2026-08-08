@@ -7,6 +7,7 @@ use super::ConnectionRecord;
 #[derive(Debug, Default)]
 pub struct ConnectionTracker {
     connections: HashMap<String, ConnectionRecord>,
+    aliases: HashMap<String, String>,
 }
 
 impl ConnectionTracker {
@@ -16,7 +17,8 @@ impl ConnectionTracker {
         process: Option<ProcessRef>,
         mut connection: ConnectionRef,
         timestamp_ns: u64,
-    ) {
+    ) -> String {
+        let original_id = connection.id.clone();
         let existing_id = if self.connections.contains_key(&connection.id) {
             None
         } else {
@@ -34,6 +36,10 @@ impl ConnectionTracker {
         if let Some(existing_id) = existing_id {
             connection.id = existing_id;
         }
+        if connection.id != original_id {
+            self.aliases.insert(original_id, connection.id.clone());
+        }
+        let canonical_id = connection.id.clone();
         self.connections
             .entry(connection.id.clone())
             .and_modify(|record| {
@@ -77,6 +83,7 @@ impl ConnectionTracker {
                 first_seen_ns: timestamp_ns,
                 last_seen_ns: timestamp_ns,
             });
+        canonical_id
     }
 
     pub fn set_domain(&mut self, pid: u32, addresses: &[String], domain: &str) {
@@ -104,7 +111,24 @@ impl ConnectionTracker {
     }
 
     pub fn get(&self, id: &str) -> Option<&ConnectionRecord> {
-        self.connections.get(id)
+        let canonical_id = self.canonical_id(id);
+        self.connections.get(canonical_id)
+    }
+
+    pub fn canonical_id<'id>(&'id self, id: &'id str) -> &'id str {
+        self.aliases.get(id).map(String::as_str).unwrap_or(id)
+    }
+
+    pub fn event_ids_for(&self, id: &str) -> Vec<String> {
+        let canonical_id = self.canonical_id(id).to_owned();
+        let mut ids = vec![canonical_id.clone()];
+        ids.extend(
+            self.aliases
+                .keys()
+                .filter(|alias| self.canonical_id(alias) == canonical_id)
+                .cloned(),
+        );
+        ids
     }
 
     pub fn all(&self) -> impl Iterator<Item = &ConnectionRecord> {
