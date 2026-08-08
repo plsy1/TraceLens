@@ -7,7 +7,7 @@ is available.
 ## Rust core
 
 ```bash
-cargo test --workspace
+cargo test --workspace --all-targets
 cargo run -p tracelens-core -- --print-example-event
 ```
 

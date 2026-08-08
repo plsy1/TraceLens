@@ -7,7 +7,7 @@ check:
 	cargo check --workspace
 
 test:
-	cargo test --workspace
+	cargo test --workspace --all-targets
 
 bpf-configure:
 	cmake -S . -B build
