@@ -9,13 +9,11 @@ set(TRACELENS_BPF_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/objects" CACHE PATH "e
 set(TRACELENS_BPF_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/kernel/process.bpf.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernel/network.bpf.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/dns.bpf.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/kernel/tcp.bpf.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernel/file.bpf.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/userspace/openssl.bpf.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/userspace/tls.bpf.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/userspace/http.bpf.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/userspace/plaintext.bpf.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/userspace/gnutls.bpf.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/userspace/nss.bpf.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/userspace/rustls.bpf.c"
 )
 
 add_custom_target(tracelens-bpf-sources SOURCES ${TRACELENS_BPF_SOURCES})
@@ -60,7 +58,9 @@ foreach(source IN LISTS TRACELENS_BPF_SOURCES)
         DEPENDS
             "${source}"
             "${CMAKE_CURRENT_SOURCE_DIR}/include/common.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/capture_filter.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/include/events.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/dns_helpers.h"
         VERBATIM
     )
     list(APPEND TRACELENS_BPF_OBJECTS "${object}")

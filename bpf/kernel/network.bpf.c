@@ -1,6 +1,9 @@
 #include "common.h"
 #include <bpf/bpf_endian.h>
 
+#define TRACELENS_CAPTURE_DEPENDENCIES
+#include "capture_filter.h"
+
 struct trace_event_raw_sys_enter {
     __u64 unused;
     long syscall_nr;
@@ -109,6 +112,25 @@ struct {
     __type(value, struct tracelens_io_request);
 } pending_io SEC(".maps");
 
+#define TRACELENS_FEATURE_TRAFFIC (1U << 0)
+#define TRACELENS_FEATURE_DNS (1U << 1)
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} feature_config SEC(".maps");
+
+static __always_inline int feature_is_enabled(__u32 feature)
+{
+    __u32 key = 0;
+    __u32 *features = bpf_map_lookup_elem(&feature_config, &key);
+    return features && (*features & feature);
+}
+
+#include "dns_helpers.h"
+
 #define TRACELENS_EINPROGRESS 115
 #define TRACELENS_EALREADY 114
 
@@ -189,6 +211,12 @@ int tracelens_connect(struct trace_event_raw_sys_enter *ctx)
     __u32 pid = pid_tgid >> 32;
     __u32 fd = (__u32)ctx->args[0];
 
+    dns_connect_enter_shared(ctx);
+
+    if (!capture_matches_current()) {
+        return 0;
+    }
+
     event.event_type = TRACELENS_EVENT_TCP_CONNECT;
     event.pid = pid;
     event.socket_id = ((__u64)pid << 32) | fd;
@@ -223,6 +251,12 @@ int tracelens_connect_exit(struct trace_event_raw_sys_exit *ctx)
     struct tracelens_socket_key key = {};
     struct tracelens_tuple_key tuple = {};
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    dns_connect_exit_shared(ctx);
+
+    if (!capture_matches_current()) {
+        return 0;
+    }
 
     pending = bpf_map_lookup_elem(&pending_connections, &pid_tgid);
     if (!pending) {
@@ -302,7 +336,7 @@ int tracelens_tcp_state(struct trace_event_raw_sock_state *ctx)
         }
         key_by_remote = bpf_map_lookup_elem(&connections_by_remote, &tuple);
         if (!key_by_remote) {
-            if (pid == 0) {
+            if (pid == 0 || !capture_matches_current()) {
                 return 0;
             }
             emit_network_event(&state);
@@ -314,7 +348,7 @@ int tracelens_tcp_state(struct trace_event_raw_sock_state *ctx)
 
     active = bpf_map_lookup_elem(&active_connections, key_by_socket);
     if (!active) {
-        if (pid == 0) {
+        if (pid == 0 || !capture_matches_current()) {
             return 0;
         }
         emit_network_event(&state);
@@ -344,6 +378,10 @@ int tracelens_close(struct trace_event_raw_sys_close *ctx)
 
     key.pid = pid_tgid >> 32;
     key.fd = (__u32)ctx->fd;
+    dns_close_shared(key.pid, key.fd);
+    if (!capture_matches_current()) {
+        return 0;
+    }
     active = bpf_map_lookup_elem(&active_connections, &key);
     if (!active) {
         return 0;
@@ -366,6 +404,10 @@ static __always_inline int remember_io(struct trace_event_raw_sys_enter *ctx, __
 {
     struct tracelens_io_request request = {};
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    if (!feature_is_enabled(TRACELENS_FEATURE_TRAFFIC) || !capture_matches_current()) {
+        return 0;
+    }
 
     request.pid = pid_tgid >> 32;
     request.fd = (__u32)ctx->args[0];
@@ -405,23 +447,35 @@ static __always_inline int account_io(struct trace_event_raw_sys_exit *ctx)
     return 0;
 }
 
-#define TRACELENS_IO_HOOKS(prefix, direction) \
+#define TRACELENS_IO_HOOKS(prefix, direction, dns_enter, dns_exit) \
 SEC("tracepoint/syscalls/sys_enter_" #prefix) \
 int tracelens_##prefix##_enter(struct trace_event_raw_sys_enter *ctx) \
 { \
+    dns_enter(ctx); \
     return remember_io(ctx, direction); \
 } \
 SEC("tracepoint/syscalls/sys_exit_" #prefix) \
 int tracelens_##prefix##_exit(struct trace_event_raw_sys_exit *ctx) \
 { \
+    dns_exit(ctx); \
     return account_io(ctx); \
 }
 
-TRACELENS_IO_HOOKS(sendto, 0)
-TRACELENS_IO_HOOKS(recvfrom, 1)
-TRACELENS_IO_HOOKS(sendmsg, 0)
-TRACELENS_IO_HOOKS(recvmsg, 1)
-TRACELENS_IO_HOOKS(write, 0)
-TRACELENS_IO_HOOKS(read, 1)
+static __always_inline void dns_noop_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    TRACELENS_UNUSED(ctx);
+}
+
+static __always_inline void dns_noop_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    TRACELENS_UNUSED(ctx);
+}
+
+TRACELENS_IO_HOOKS(sendto, 0, dns_sendto_shared, dns_noop_exit)
+TRACELENS_IO_HOOKS(recvfrom, 1, dns_recvfrom_shared, dns_receive_exit_shared)
+TRACELENS_IO_HOOKS(sendmsg, 0, dns_sendmsg_shared, dns_noop_exit)
+TRACELENS_IO_HOOKS(recvmsg, 1, dns_recvmsg_shared, dns_receive_exit_shared)
+TRACELENS_IO_HOOKS(write, 0, dns_write_shared, dns_noop_exit)
+TRACELENS_IO_HOOKS(read, 1, dns_read_shared, dns_receive_exit_shared)
 
 char LICENSE[] SEC("license") = "GPL";

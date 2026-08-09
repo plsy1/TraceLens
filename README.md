@@ -2,7 +2,7 @@
 
 TraceLens is a Linux process-aware network observation tool built on eBPF.
 It is designed as a capture utility: the observer starts idle, you select a
-process or scope, choose an observation level, start a capture, inspect the
+process or scope, choose a capture profile and modules, start a capture, inspect the
 traffic, and stop or reset the session when finished.
 
 ## What it does
@@ -11,8 +11,10 @@ traffic, and stop or reset the session when finished.
   kernel probes.
 - Correlates processes, connections, DNS names, TLS sessions, and HTTP
   messages into one local event model.
-- Uses optional userspace OpenSSL probes for TLS metadata, bounded HTTP/1.1
-  inspection, and bounded plaintext inspection.
+- Auto-detects OpenSSL-family, GnuTLS, NSS/NSPR, and dynamic rustls-ffi
+  libraries, then uses optional userspace probes for TLS metadata, bounded
+  HTTP/1.1 inspection, and bounded plaintext inspection. Go and Java runtimes
+  are reported explicitly when no version-safe deep adapter is available.
 - Provides a local HTTP API and a Web UI with process, connection, session,
   and event views.
 - Keeps capture data in memory by default. SQLite history is opt-in.
@@ -21,25 +23,27 @@ Payload capture is intentionally bounded. Small textual HTTP bodies such as
 HTML, JSON, XML, JavaScript, and CSS can be previewed; large, binary, media,
 archive, or compressed content is represented by metadata and byte counts.
 
-## Observation levels
+## Capture profiles and modules
 
-| Level | Collected data |
+| Profile | Enabled modules |
 | --- | --- |
-| L1 | Process, network, TCP, and DNS metadata; no payload bytes |
-| L2 | Reserved for additional probe capabilities |
-| L3 | L1 data plus TLS metadata such as SNI, version, SSL object, and fd correlation |
-| L4 | L3 data plus parsed HTTP/1.1 metadata and bounded small-text previews |
-| L5 | L4 data plus bounded raw plaintext previews from selected userspace targets |
+| Process | Process lifecycle |
+| Connections | Process + TCP connection lifecycle |
+| Network | Connections + traffic counters + DNS |
+| Web | Network + TLS metadata + HTTP |
+| Security | Network + TLS metadata + file activity |
+| Custom | Any explicitly selected module combination |
 
-The global level is the baseline for all processes. A PID or process-name
-capture can apply a target-specific level. L4 uses bounded plaintext capture
-internally to reconstruct HTTP, but raw plaintext fragments are only exposed
-at L5.
+Profiles are presets; the selected modules are the source of truth. Module
+dependencies are added automatically. Plaintext is not part of a default
+profile and requires explicit confirmation for every capture. HTTP and
+Plaintext share bounded TLS payload probes, but raw fragments are retained
+only when the Plaintext module is enabled.
 
 ## Architecture
 
 ```text
-core/           Rust service, observation manager, correlation, API, and runtime
+core/           Rust service, capture planner, correlation, API, and runtime
 crates/events/  Shared serialized event model
 bpf/            C/eBPF kernel and userspace probes
 ui/             Vite/React Web UI and Tauri shell
@@ -94,7 +98,7 @@ Open the URL printed by Vite from another machine. In the capture console:
 
 1. Select `Selected PID`, `Process name`, or `Global`.
 2. Enter a PID or process name when needed.
-3. Select L1-L5.
+3. Select a Profile and adjust Modules if needed.
 4. Press `Start capture`.
 5. Generate traffic, inspect the active workspace, then press `Stop`.
 6. Press `Reset` to discard the in-memory session and start a fresh capture.
@@ -104,12 +108,53 @@ Sessions, or Raw events. Tables support sorting, pagination, and draggable
 column widths. Payload details open in a bounded modal instead of loading
 large files into the browser.
 
+## Linux desktop application
+
+TraceLens Desktop packages the Web UI, Core, BPF objects, and required Core
+runtime libraries into one application. Opening it checks for an existing
+Core on `127.0.0.1:8080`; otherwise the system `pkexec` dialog asks for
+administrator authorization and starts the bundled Core. Core still starts
+idle and does not attach probes until `Start capture` is pressed. Closing the
+desktop application stops only the Core it launched and releases its BPF
+links.
+
+Install the Debian package and open **TraceLens** from the application menu:
+
+```bash
+sudo apt install ./TraceLens_0.0.1_amd64.deb
+```
+
+Or run the portable AppImage:
+
+```bash
+chmod +x TraceLens_0.0.1_amd64.AppImage
+./TraceLens_0.0.1_amd64.AppImage
+```
+
+The AppImage host must provide `pkexec` and a running Polkit authentication
+agent. Build both packages from a clean checkout with:
+
+```bash
+cd ui
+npm ci
+npm run desktop:build
+```
+
+Artifacts are written below `ui/src-tauri/target/release/bundle/`. Linux
+packages currently target x86_64. Because glibc is not fully portable across
+older distributions, release builds should use the oldest supported Linux
+base image.
+
 ## Local API
 
 The default API address is `127.0.0.1:8080`. Useful endpoints include:
 
 ```text
 GET  /api/health
+GET  /api/capabilities
+GET  /api/tls-capabilities
+GET  /api/capture
+GET  /api/capture/plan
 GET  /api/summary
 GET  /api/process-candidates
 GET  /api/processes
@@ -117,17 +162,24 @@ GET  /api/connections
 GET  /api/timeline
 GET  /api/connection-timeline
 GET  /api/alerts
-GET  /api/observations
-GET  /api/observations/default
 POST /api/capture/start
 POST /api/capture/stop
 POST /api/capture/reset
-POST /api/observations
-POST /api/observations/default
 ```
 
 Capture commands accept a target of `global`, `process:<pid>`, or
-`process-name:<name>`. The API is intended for local tooling and does not
+`process-name:<name>`, plus a profile and module list:
+
+```json
+{
+  "target": "process-name:curl",
+  "profile": "web",
+  "modules": ["process", "connections", "traffic", "dns", "tls", "http"]
+}
+```
+
+Legacy `level` input is temporarily translated at the API boundary and is
+deprecated. The API is intended for local tooling and does not
 provide authentication or remote multi-user access.
 
 ## Storage
@@ -167,10 +219,18 @@ Run the repository checks before submitting changes:
 cargo fmt --all -- --check
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cmake --build build --clean-first
 cd ui && npm run build
 ```
+
+On a Linux host with passwordless BPF privileges, run the isolated runtime
+acceptance test with `./scripts/privileged-e2e.sh`.
 
 More detailed engineering notes are available in
 [`docs/architecture.md`](docs/architecture.md),
 [`docs/deployment.md`](docs/deployment.md), and
-[`docs/development_workflow.md`](docs/development_workflow.md).
+[`docs/development_workflow.md`](docs/development_workflow.md). The tag-driven
+GitHub Release process is documented in
+[`docs/releasing.md`](docs/releasing.md). Probe resource
+measurements and their limitations are recorded in
+[`docs/performance.md`](docs/performance.md).

@@ -1,0 +1,130 @@
+name: TraceLens Linux Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: tracelens-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    name: Build and publish Linux x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag and main ancestry
+        shell: bash
+        run: |
+          ./scripts/verify-release-version.sh "$RELEASE_TAG"
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "Release tag $RELEASE_TAG is not reachable from origin/main" >&2
+            exit 1
+          }
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            build-essential \
+            clang \
+            cmake \
+            file \
+            libayatana-appindicator3-dev \
+            libbpf-dev \
+            libelf-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            llvm \
+            patchelf \
+            pkg-config \
+            zlib1g-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.0
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Validate source
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          ./scripts/prepare-desktop.sh debug
+          cargo check --manifest-path ui/src-tauri/Cargo.toml --locked
+          npm audit --prefix ui --audit-level=moderate
+          npm run build --prefix ui
+
+      - name: Build desktop packages
+        working-directory: ui
+        run: npm run desktop:build -- --ci
+
+      - name: Stage and inspect artifacts
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          deb="ui/src-tauri/target/release/bundle/deb/TraceLens_${version}_amd64.deb"
+          appimage="ui/src-tauri/target/release/bundle/appimage/TraceLens_${version}_amd64.AppImage"
+          test -f "$deb"
+          test -x "$appimage"
+          test "$(dpkg-deb -c "$deb" | awk '/bpf\/objects\/.*\.o$/ { count++ } END { print count+0 }')" -eq 7
+          dpkg-deb -f "$deb" Depends | grep -q 'pkexec'
+          mkdir -p dist
+          cp "$deb" "$appimage" dist/
+          (cd dist && sha256sum TraceLens_* > SHA256SUMS)
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TraceLens-${{ github.ref_name }}-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != true ]]; then
+              echo "GitHub Release $RELEASE_TAG is already published; refusing to replace it" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "TraceLens $RELEASE_TAG"
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false

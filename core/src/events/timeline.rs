@@ -48,6 +48,8 @@ pub struct ConnectionTimelineFilter {
     pub include_closed: bool,
     pub include_events: bool,
     pub event_limit: usize,
+    pub sort_by: ConnectionTimelineSort,
+    pub sort_descending: bool,
     pub offset: usize,
     pub limit: usize,
 }
@@ -61,10 +63,21 @@ impl Default for ConnectionTimelineFilter {
             include_closed: true,
             include_events: true,
             event_limit: 200,
+            sort_by: ConnectionTimelineSort::LastSeen,
+            sort_descending: true,
             offset: 0,
             limit: 50,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTimelineSort {
+    Route,
+    State,
+    Details,
+    Id,
+    LastSeen,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -104,6 +117,9 @@ pub struct TimelineEntry {
     pub id: String,
     pub timestamp_ns: u64,
     pub source: EventSource,
+    pub tls_provider: Option<String>,
+    pub tls_library: Option<String>,
+    pub tls_api_function: Option<String>,
     pub kind: EventKind,
     pub pid: Option<u32>,
     pub process_name: Option<String>,
@@ -148,6 +164,7 @@ pub struct TimelineEntry {
 
 impl TimelineEntry {
     pub fn from_event(event: TraceEvent) -> Self {
+        let instrumentation = event.instrumentation.clone();
         let process_name = event
             .process
             .as_ref()
@@ -160,6 +177,13 @@ impl TimelineEntry {
             id: event.id,
             timestamp_ns: event.timestamp_ns,
             source: event.source,
+            tls_provider: instrumentation
+                .as_ref()
+                .map(|source| source.provider.clone()),
+            tls_library: instrumentation
+                .as_ref()
+                .map(|source| source.library.clone()),
+            tls_api_function: instrumentation.map(|source| source.api_function),
             kind: event.kind,
             pid: event.pid,
             process_name: process_name.clone(),

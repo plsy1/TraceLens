@@ -1,13 +1,15 @@
 pub mod bpftime;
 pub mod kernel;
+pub mod provider;
 pub mod selector;
 pub mod userspace;
 
 use std::fmt;
 
+use crate::capture::{CaptureFeatures, CaptureModule};
 use crate::observation::ObservationLevel;
 
-pub use userspace::{ProbeAttachment, ProbeRuntime};
+pub use userspace::{ProbeAttachment, ProbeRuntime, UserspaceProbeDiagnostics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserspaceRuntime {
@@ -34,23 +36,25 @@ impl fmt::Display for ProbeKind {
     }
 }
 
-pub fn probes_for_level(level: ObservationLevel) -> Vec<ProbeKind> {
+pub fn probes_for_features(features: CaptureFeatures) -> Vec<ProbeKind> {
     let mut probes = Vec::new();
-    if level >= ObservationLevel::L3 {
+    if features.contains(CaptureModule::Tls) {
         probes.push(ProbeKind::Tls);
     }
-    if level == ObservationLevel::L4 {
-        // Use the bounded SSL payload capture as the transport for HTTP
-        // reconstruction. The dedicated HTTP object has the same hooks, but
-        // is not reliable on every kernel/libbpf combination. Core derives
-        // HTTP messages from these chunks and only exposes those messages at
-        // L4; raw chunks remain an L5-only view.
-        probes.push(ProbeKind::Plaintext);
-    }
-    if level >= ObservationLevel::L5 {
+    if features.contains(CaptureModule::Http) || features.contains(CaptureModule::Plaintext) {
+        // HTTP reconstruction and the raw plaintext view share the bounded
+        // SSL_read/SSL_write transport. Retention is decided independently
+        // by CaptureFeatures in Core.
         probes.push(ProbeKind::Plaintext);
     }
     probes
+}
+
+#[deprecated(note = "translate legacy levels at the API boundary and use CaptureFeatures")]
+pub fn probes_for_level(level: ObservationLevel) -> Vec<ProbeKind> {
+    let features = CaptureFeatures::legacy_level(level as u8)
+        .expect("ObservationLevel always maps to legacy CaptureFeatures");
+    probes_for_features(features)
 }
 
 impl fmt::Display for UserspaceRuntime {
@@ -124,15 +128,19 @@ impl RuntimeStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{probes_for_level, ProbeKind, UserspaceRuntime};
-    use crate::observation::ObservationLevel;
+    use super::{probes_for_features, ProbeKind, UserspaceRuntime};
+    use crate::capture::{CaptureFeatures, CaptureModule};
 
     #[test]
-    fn probe_dependencies_grow_with_observation_level() {
-        assert!(probes_for_level(ObservationLevel::L1).is_empty());
-        assert_eq!(probes_for_level(ObservationLevel::L3), vec![ProbeKind::Tls]);
+    fn probe_dependencies_follow_capture_features() {
+        let network = CaptureFeatures::legacy_level(1).expect("network features");
+        assert!(probes_for_features(network).is_empty());
+        let tls = CaptureFeatures::from_modules([CaptureModule::Tls]);
+        assert_eq!(probes_for_features(tls), vec![ProbeKind::Tls]);
+        let plaintext =
+            CaptureFeatures::from_modules([CaptureModule::Tls, CaptureModule::Plaintext]);
         assert_eq!(
-            probes_for_level(ObservationLevel::L5),
+            probes_for_features(plaintext),
             vec![ProbeKind::Tls, ProbeKind::Plaintext]
         );
     }

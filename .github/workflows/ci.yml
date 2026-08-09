@@ -152,17 +152,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
             build-essential \
+            clang \
+            cmake \
             curl \
             file \
+            libbpf-dev \
+            libelf-dev \
             libayatana-appindicator3-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
             librsvg2-dev \
+            llvm \
+            patchelf \
             pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Check Tauri backend
-        run: cargo check --manifest-path ui/src-tauri/Cargo.toml
+        run: |
+          ./scripts/prepare-desktop.sh debug
+          cargo check --manifest-path ui/src-tauri/Cargo.toml

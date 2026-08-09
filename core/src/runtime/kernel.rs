@@ -6,21 +6,20 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc::Sender,
-    Arc,
-};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use std::{net::IpAddr, net::Ipv4Addr, net::Ipv6Addr};
 
-use libbpf_rs::{Link, MapCore, Object, ObjectBuilder, RingBufferBuilder};
+use libbpf_rs::{Link, MapCore, MapFlags, Object, ObjectBuilder, RingBufferBuilder};
 use tracelens_events::{
     ConnectionRef, ConnectionState, DnsEventData, Endpoint, EventKind, EventSource, FileEventData,
     ProcessRef, TcpState, TraceEvent, TransportProtocol,
 };
 
+use crate::capture::{CaptureFeatures, CaptureModule};
 use crate::config::CoreConfig;
+use crate::CaptureScope;
 
 const EVENT_PROCESS_EXEC: u16 = 1;
 const EVENT_PROCESS_EXIT: u16 = 2;
@@ -40,6 +39,18 @@ const COMM_LEN: usize = 16;
 const ADDR_LEN: usize = 16;
 const DNS_PAYLOAD_LEN: usize = 512;
 const FILE_PATH_LEN: usize = 256;
+const SCOPE_GLOBAL: u32 = 0;
+const SCOPE_PID: u32 = 1;
+const SCOPE_COMM: u32 = 2;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KernelCaptureConfig {
+    active: u32,
+    scope_mode: u32,
+    target_pid: u32,
+    target_comm: [u8; COMM_LEN],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -94,153 +105,464 @@ struct KernelFileEvent {
     path: [u8; FILE_PATH_LEN],
 }
 
-#[derive(Debug, Default)]
-pub struct KernelRuntime {
-    attached: bool,
+const PROCESS_PROGRAMS: &[&str] = &["tracelens_process_exec", "tracelens_process_exit"];
+const CONNECTION_PROGRAMS: &[&str] = &[
+    "tracelens_connect",
+    "tracelens_connect_exit",
+    "tracelens_close",
+    "tracelens_tcp_state",
+];
+const TRAFFIC_PROGRAMS: &[&str] = &[
+    "tracelens_sendto_enter",
+    "tracelens_sendto_exit",
+    "tracelens_recvfrom_enter",
+    "tracelens_recvfrom_exit",
+    "tracelens_sendmsg_enter",
+    "tracelens_sendmsg_exit",
+    "tracelens_recvmsg_enter",
+    "tracelens_recvmsg_exit",
+    "tracelens_write_enter",
+    "tracelens_write_exit",
+    "tracelens_read_enter",
+    "tracelens_read_exit",
+];
+const FILE_PROGRAMS: &[&str] = &["tracelens_file_open"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelRuntimeState {
+    Idle,
+    Attaching,
+    Capturing,
+    Failed,
 }
 
-impl KernelRuntime {
-    pub fn is_attached(&self) -> bool {
-        self.attached
+impl std::fmt::Display for KernelRuntimeState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Idle => "idle",
+            Self::Attaching => "attaching",
+            Self::Capturing => "capturing",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelRuntimeStatus {
+    pub state: KernelRuntimeState,
+    pub objects: Vec<String>,
+    pub programs: Vec<String>,
+    pub link_count: usize,
+    pub capture_target: Option<String>,
+    pub error: Option<String>,
+}
+
+impl Default for KernelRuntimeStatus {
+    fn default() -> Self {
+        Self {
+            state: KernelRuntimeState::Idle,
+            objects: Vec::new(),
+            programs: Vec::new(),
+            link_count: 0,
+            capture_target: None,
+            error: None,
+        }
+    }
+}
+
+enum KernelCommand {
+    Apply {
+        features: CaptureFeatures,
+        target: CaptureScope,
+        reply: mpsc::Sender<Result<KernelRuntimeStatus, String>>,
+    },
+    Stop {
+        reply: mpsc::Sender<Result<KernelRuntimeStatus, String>>,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelRuntimeController {
+    commands: mpsc::Sender<KernelCommand>,
+    status: Arc<Mutex<KernelRuntimeStatus>>,
+}
+
+impl KernelRuntimeController {
+    pub fn spawn(config: CoreConfig, sender: mpsc::Sender<TraceEvent>) -> Self {
+        let (commands, receiver) = mpsc::channel();
+        let status = Arc::new(Mutex::new(KernelRuntimeStatus::default()));
+        let worker_status = Arc::clone(&status);
+        thread::spawn(move || kernel_worker(config, sender, receiver, worker_status));
+        Self { commands, status }
     }
 
-    pub fn attach(&mut self) {
-        self.attached = true;
+    pub fn apply_plan(
+        &self,
+        features: CaptureFeatures,
+        target: CaptureScope,
+    ) -> Result<KernelRuntimeStatus, String> {
+        let (reply, response) = mpsc::channel();
+        self.commands
+            .send(KernelCommand::Apply {
+                features,
+                target,
+                reply,
+            })
+            .map_err(|_| "kernel runtime worker is unavailable".to_owned())?;
+        response
+            .recv()
+            .map_err(|_| "kernel runtime worker stopped before applying the plan".to_owned())?
     }
 
-    pub fn detach(&mut self) {
-        self.attached = false;
+    pub fn stop(&self) -> Result<KernelRuntimeStatus, String> {
+        let (reply, response) = mpsc::channel();
+        self.commands
+            .send(KernelCommand::Stop { reply })
+            .map_err(|_| "kernel runtime worker is unavailable".to_owned())?;
+        response
+            .recv()
+            .map_err(|_| "kernel runtime worker stopped before detaching".to_owned())?
     }
 
-    /// Load the process/network/DNS objects, attach their tracepoints, and forward events.
-    pub fn run(
-        config: &CoreConfig,
-        sender: Sender<TraceEvent>,
-        capture_gate: Arc<AtomicBool>,
-    ) -> Result<(), String> {
-        let process_path = config.bpf_object_dir.join("process.o");
-        let network_path = config.bpf_object_dir.join("network.o");
-        let dns_path = config.bpf_object_dir.join("dns.o");
-        let file_path = config.bpf_object_dir.join("file.o");
-        ensure_object_exists(&process_path)?;
-        ensure_object_exists(&network_path)?;
-        ensure_object_exists(&dns_path)?;
-        ensure_object_exists(&file_path)?;
+    pub fn status(&self) -> KernelRuntimeStatus {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or(KernelRuntimeStatus {
+                state: KernelRuntimeState::Failed,
+                error: Some("kernel runtime status lock is poisoned".to_owned()),
+                ..KernelRuntimeStatus::default()
+            })
+    }
 
-        let mut process_object = load_object(&process_path)?;
-        let mut network_object = load_object(&network_path)?;
-        let mut dns_object = load_object(&dns_path)?;
-        let mut file_object = load_object(&file_path)?;
+    pub fn shutdown(&self) {
+        let _ = self.commands.send(KernelCommand::Shutdown);
+    }
+}
 
-        let _process_exec_link = attach_program(&mut process_object, "tracelens_process_exec")?;
-        let _process_exit_link = attach_program(&mut process_object, "tracelens_process_exit")?;
-        let _connect_link = attach_program(&mut network_object, "tracelens_connect")?;
-        let _connect_exit_link = attach_program(&mut network_object, "tracelens_connect_exit")?;
-        let _close_link = attach_program(&mut network_object, "tracelens_close")?;
-        let _tcp_state_link = attach_program(&mut network_object, "tracelens_tcp_state")?;
-        let _sendto_enter_link = attach_program(&mut network_object, "tracelens_sendto_enter")?;
-        let _sendto_exit_link = attach_program(&mut network_object, "tracelens_sendto_exit")?;
-        let _recvfrom_enter_link = attach_program(&mut network_object, "tracelens_recvfrom_enter")?;
-        let _recvfrom_exit_link = attach_program(&mut network_object, "tracelens_recvfrom_exit")?;
-        let _sendmsg_enter_link = attach_program(&mut network_object, "tracelens_sendmsg_enter")?;
-        let _sendmsg_exit_link = attach_program(&mut network_object, "tracelens_sendmsg_exit")?;
-        let _recvmsg_enter_link = attach_program(&mut network_object, "tracelens_recvmsg_enter")?;
-        let _recvmsg_exit_link = attach_program(&mut network_object, "tracelens_recvmsg_exit")?;
-        let _write_enter_link = attach_program(&mut network_object, "tracelens_write_enter")?;
-        let _write_exit_link = attach_program(&mut network_object, "tracelens_write_exit")?;
-        let _read_enter_link = attach_program(&mut network_object, "tracelens_read_enter")?;
-        let _read_exit_link = attach_program(&mut network_object, "tracelens_read_exit")?;
-        let _dns_send_link = attach_program(&mut dns_object, "tracelens_dns_send")?;
-        let _dns_connect_enter_link =
-            attach_program(&mut dns_object, "tracelens_dns_connect_enter")?;
-        let _dns_connect_exit_link = attach_program(&mut dns_object, "tracelens_dns_connect_exit")?;
-        let _dns_recv_enter_link = attach_program(&mut dns_object, "tracelens_dns_recv_enter")?;
-        let _dns_recv_exit_link = attach_program(&mut dns_object, "tracelens_dns_recv_exit")?;
-        let _dns_sendmsg_link = attach_program(&mut dns_object, "tracelens_dns_sendmsg")?;
-        let _dns_recvmsg_link = attach_program(&mut dns_object, "tracelens_dns_recvmsg")?;
-        let _dns_recvmsg_exit_link = attach_program(&mut dns_object, "tracelens_dns_recvmsg_exit")?;
-        let _dns_write_link = attach_program(&mut dns_object, "tracelens_dns_write")?;
-        let _dns_read_link = attach_program(&mut dns_object, "tracelens_dns_read")?;
-        let _dns_read_exit_link = attach_program(&mut dns_object, "tracelens_dns_read_exit")?;
-        let _dns_close_link = attach_program(&mut dns_object, "tracelens_dns_close")?;
-        let _file_open_link = attach_program(&mut file_object, "tracelens_file_open")?;
-
-        let process_events = find_map(&process_object, "events")?;
-        let network_events = find_map(&network_object, "events")?;
-        let dns_events = find_map(&dns_object, "events")?;
-        let file_events = find_map(&file_object, "events")?;
-        let process_sender = sender.clone();
-        let network_sender = sender.clone();
-        let dns_sender = sender;
-        let file_sender = dns_sender.clone();
-        let process_cache = Rc::new(RefCell::new(HashMap::<u32, ProcessRef>::new()));
-        let process_cache_for_process = Rc::clone(&process_cache);
-        let process_cache_for_network = Rc::clone(&process_cache);
-        let process_gate = Arc::clone(&capture_gate);
-        let network_gate = Arc::clone(&capture_gate);
-        let dns_gate = Arc::clone(&capture_gate);
-        let file_gate = capture_gate;
-
-        let mut ring_buffer_builder = RingBufferBuilder::new();
-        ring_buffer_builder
-            .add(&process_events, move |data| {
-                if !process_gate.load(Ordering::Acquire) {
-                    return 0;
+fn kernel_worker(
+    config: CoreConfig,
+    sender: mpsc::Sender<TraceEvent>,
+    commands: mpsc::Receiver<KernelCommand>,
+    status: Arc<Mutex<KernelRuntimeStatus>>,
+) {
+    let mut command = match commands.recv() {
+        Ok(command) => command,
+        Err(_) => return,
+    };
+    loop {
+        match command {
+            KernelCommand::Apply {
+                features,
+                target,
+                reply,
+            } => {
+                set_kernel_status(
+                    &status,
+                    KernelRuntimeStatus {
+                        state: KernelRuntimeState::Attaching,
+                        ..KernelRuntimeStatus::default()
+                    },
+                );
+                match run_kernel_plan(
+                    &config,
+                    sender.clone(),
+                    features,
+                    target,
+                    &commands,
+                    &status,
+                    &reply,
+                ) {
+                    Ok(next) => command = next,
+                    Err(error) => {
+                        set_kernel_status(
+                            &status,
+                            KernelRuntimeStatus {
+                                state: KernelRuntimeState::Failed,
+                                error: Some(error.clone()),
+                                ..KernelRuntimeStatus::default()
+                            },
+                        );
+                        let _ = reply.send(Err(error));
+                        command = match commands.recv() {
+                            Ok(command) => command,
+                            Err(_) => return,
+                        };
+                    }
                 }
+            }
+            KernelCommand::Stop { reply } => {
+                let idle = KernelRuntimeStatus::default();
+                set_kernel_status(&status, idle.clone());
+                let _ = reply.send(Ok(idle));
+                command = match commands.recv() {
+                    Ok(command) => command,
+                    Err(_) => return,
+                };
+            }
+            KernelCommand::Shutdown => return,
+        }
+    }
+}
+
+fn run_kernel_plan(
+    config: &CoreConfig,
+    sender: mpsc::Sender<TraceEvent>,
+    features: CaptureFeatures,
+    target: CaptureScope,
+    commands: &mpsc::Receiver<KernelCommand>,
+    shared_status: &Arc<Mutex<KernelRuntimeStatus>>,
+    apply_reply: &mpsc::Sender<Result<KernelRuntimeStatus, String>>,
+) -> Result<KernelCommand, String> {
+    let process_enabled = features.contains(CaptureModule::Process);
+    let connections_enabled = features.contains(CaptureModule::Connections);
+    let traffic_enabled = features.contains(CaptureModule::Traffic);
+    let dns_enabled = features.contains(CaptureModule::Dns);
+    let files_enabled = features.contains(CaptureModule::Files);
+
+    let mut process_object = load_optional_object(config, "process.o", process_enabled)?;
+    let mut network_object = load_optional_object(
+        config,
+        "network.o",
+        connections_enabled || traffic_enabled || dns_enabled,
+    )?;
+    let mut file_object = load_optional_object(config, "file.o", files_enabled)?;
+
+    for object in [&process_object, &network_object, &file_object]
+        .into_iter()
+        .flatten()
+    {
+        set_capture_scope(object, &target)?;
+    }
+    if let Some(object) = network_object.as_ref() {
+        set_network_features(object, traffic_enabled, dns_enabled)?;
+        if dns_enabled {
+            set_dns_dependency_pids(object, &discover_dns_dependency_pids())?;
+        }
+    }
+
+    let mut links = Vec::new();
+    let mut programs = Vec::new();
+    if let Some(object) = process_object.as_mut() {
+        attach_programs(object, PROCESS_PROGRAMS, &mut links, &mut programs)?;
+    }
+    if let Some(object) = network_object.as_mut() {
+        if connections_enabled {
+            attach_programs(object, CONNECTION_PROGRAMS, &mut links, &mut programs)?;
+        }
+        if traffic_enabled || dns_enabled {
+            attach_programs(object, TRAFFIC_PROGRAMS, &mut links, &mut programs)?;
+        }
+    }
+    if let Some(object) = file_object.as_mut() {
+        attach_programs(object, FILE_PROGRAMS, &mut links, &mut programs)?;
+    }
+
+    let process_cache = Rc::new(RefCell::new(HashMap::<u32, ProcessRef>::new()));
+    let process_events = process_object
+        .as_ref()
+        .map(|object| find_map(object, "events"))
+        .transpose()?;
+    let network_events = network_object
+        .as_ref()
+        .map(|object| find_map(object, "events"))
+        .transpose()?;
+    let file_events = file_object
+        .as_ref()
+        .map(|object| find_map(object, "events"))
+        .transpose()?;
+    let mut ring_buffer_builder = RingBufferBuilder::new();
+    if let Some(events) = process_events.as_ref() {
+        let event_sender = sender.clone();
+        let cache = Rc::clone(&process_cache);
+        ring_buffer_builder
+            .add(events, move |data| {
                 if let Some(event) = decode_process_event(data) {
-                    update_process_cache(&process_cache_for_process, &event);
-                    let _ = process_sender.send(event);
+                    update_process_cache(&cache, &event);
+                    let _ = event_sender.send(event);
                 }
                 0
             })
             .map_err(|error| format!("failed to register process ring buffer: {error}"))?;
+    }
+    if let Some(events) = network_events.as_ref() {
+        let event_sender = sender.clone();
+        let cache = Rc::clone(&process_cache);
         ring_buffer_builder
-            .add(&network_events, move |data| {
-                if !network_gate.load(Ordering::Acquire) {
-                    return 0;
-                }
-                if let Some(event) = decode_network_event(data, &process_cache_for_network) {
-                    let _ = network_sender.send(event);
+            .add(events, move |data| {
+                if let Some(event) =
+                    decode_network_event(data, &cache).or_else(|| decode_dns_event(data))
+                {
+                    let _ = event_sender.send(event);
                 }
                 0
             })
             .map_err(|error| format!("failed to register network ring buffer: {error}"))?;
+    }
+    if let Some(events) = file_events.as_ref() {
         ring_buffer_builder
-            .add(&dns_events, move |data| {
-                if !dns_gate.load(Ordering::Acquire) {
-                    return 0;
-                }
-                if let Some(event) = decode_dns_event(data) {
-                    let _ = dns_sender.send(event);
-                }
-                0
-            })
-            .map_err(|error| format!("failed to register DNS ring buffer: {error}"))?;
-        ring_buffer_builder
-            .add(&file_events, move |data| {
-                if !file_gate.load(Ordering::Acquire) {
-                    return 0;
-                }
+            .add(events, move |data| {
                 if let Some(event) = decode_file_event(data) {
-                    let _ = file_sender.send(event);
+                    let _ = sender.send(event);
                 }
                 0
             })
             .map_err(|error| format!("failed to register file ring buffer: {error}"))?;
+    }
+    let ring_buffer = ring_buffer_builder
+        .build()
+        .map_err(|error| format!("failed to build kernel ring buffer: {error}"))?;
 
-        let ring_buffer = ring_buffer_builder
-            .build()
-            .map_err(|error| format!("failed to build ring buffer: {error}"))?;
+    let mut objects = Vec::new();
+    if process_object.is_some() {
+        objects.push("process.o".to_owned());
+    }
+    if network_object.is_some() {
+        objects.push("network.o".to_owned());
+    }
+    if file_object.is_some() {
+        objects.push("file.o".to_owned());
+    }
+    let attached = KernelRuntimeStatus {
+        state: KernelRuntimeState::Capturing,
+        objects,
+        link_count: links.len(),
+        programs,
+        capture_target: Some(target.to_string()),
+        error: None,
+    };
+    set_kernel_status(shared_status, attached.clone());
+    let _ = apply_reply.send(Ok(attached));
 
-        loop {
-            ring_buffer
-                // Process-name capture must react to ProcessExec quickly:
-                // otherwise a short-lived TLS client can finish its first
-                // SSL_read before Core has a chance to attach user probes.
-                .poll(Duration::from_millis(10))
-                .map_err(|error| format!("kernel ring buffer stopped: {error}"))?;
+    loop {
+        if let Ok(command) = commands.try_recv() {
+            drop(ring_buffer);
+            drop(links);
+            let idle = KernelRuntimeStatus::default();
+            set_kernel_status(shared_status, idle);
+            return Ok(command);
+        }
+        ring_buffer
+            .poll(Duration::from_millis(10))
+            .map_err(|error| format!("kernel ring buffer stopped: {error}"))?;
+    }
+}
+
+fn set_kernel_status(status: &Arc<Mutex<KernelRuntimeStatus>>, value: KernelRuntimeStatus) {
+    if let Ok(mut status) = status.lock() {
+        *status = value;
+    }
+}
+
+fn load_optional_object(
+    config: &CoreConfig,
+    file: &str,
+    enabled: bool,
+) -> Result<Option<Object>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    let path = config.bpf_object_dir.join(file);
+    ensure_object_exists(&path)?;
+    load_object(&path).map(Some)
+}
+
+fn attach_programs(
+    object: &mut Object,
+    names: &[&str],
+    links: &mut Vec<Link>,
+    attached_names: &mut Vec<String>,
+) -> Result<(), String> {
+    for name in names {
+        links.push(attach_program(object, name)?);
+        attached_names.push((*name).to_owned());
+    }
+    Ok(())
+}
+
+fn set_network_features(object: &Object, traffic: bool, dns: bool) -> Result<(), String> {
+    let map = find_map(object, "feature_config")?;
+    let key = 0_u32.to_ne_bytes();
+    let flags = u32::from(traffic) | (u32::from(dns) << 1);
+    map.update(&key, &flags.to_ne_bytes(), MapFlags::ANY)
+        .map_err(|error| format!("failed to configure network features: {error}"))
+}
+
+fn set_capture_scope(object: &Object, target: &CaptureScope) -> Result<(), String> {
+    let map = find_map(object, "capture_config")?;
+    let key = 0_u32.to_ne_bytes();
+    let config = kernel_capture_config(target);
+    let mut value = Vec::with_capacity(12 + COMM_LEN);
+    value.extend_from_slice(&config.active.to_ne_bytes());
+    value.extend_from_slice(&config.scope_mode.to_ne_bytes());
+    value.extend_from_slice(&config.target_pid.to_ne_bytes());
+    value.extend_from_slice(&config.target_comm);
+    map.update(&key, &value, MapFlags::ANY)
+        .map_err(|error| format!("failed to configure capture scope `{target}`: {error}"))
+}
+
+fn kernel_capture_config(target: &CaptureScope) -> KernelCaptureConfig {
+    let mut config = KernelCaptureConfig {
+        active: 1,
+        scope_mode: SCOPE_GLOBAL,
+        target_pid: 0,
+        target_comm: [0; COMM_LEN],
+    };
+    match target {
+        CaptureScope::Global => {}
+        CaptureScope::Process(pid) => {
+            config.scope_mode = SCOPE_PID;
+            config.target_pid = *pid;
+        }
+        CaptureScope::ProcessName(name) => {
+            config.scope_mode = SCOPE_COMM;
+            let bytes = name.as_bytes();
+            let length = bytes.len().min(COMM_LEN - 1);
+            config.target_comm[..length].copy_from_slice(&bytes[..length]);
         }
     }
+    config
+}
+
+fn set_dns_dependency_pids(object: &Object, pids: &[u32]) -> Result<(), String> {
+    let map = find_map(object, "dependency_pids")?;
+    for pid in pids {
+        map.update(&pid.to_ne_bytes(), &[1], MapFlags::ANY)
+            .map_err(|error| format!("failed to register DNS resolver PID {pid}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn discover_dns_dependency_pids() -> Vec<u32> {
+    let mut pids = fs::read_dir("/proc")
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| is_dns_dependency_pid(*pid))
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids
+}
+
+pub(crate) fn is_dns_dependency_name(name: &str) -> bool {
+    matches!(
+        name,
+        "systemd-resolve"
+            | "systemd-resolved"
+            | "nscd"
+            | "dnsmasq"
+            | "unbound"
+            | "named"
+            | "resolved"
+    )
+}
+
+pub(crate) fn is_dns_dependency_pid(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .is_some_and(|comm| is_dns_dependency_name(comm.trim()))
 }
 
 fn ensure_object_exists(path: &Path) -> Result<(), String> {
@@ -696,9 +1018,16 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_address, parse_dns_message, KernelDnsEvent, KernelNetworkEvent, KernelProcessEvent,
+        decode_address, is_dns_dependency_name, kernel_capture_config, parse_dns_message,
+        KernelDnsEvent, KernelNetworkEvent, KernelProcessEvent, KernelRuntimeController,
+        KernelRuntimeState, CONNECTION_PROGRAMS, FILE_PROGRAMS, PROCESS_PROGRAMS, SCOPE_COMM,
+        SCOPE_GLOBAL, SCOPE_PID, TRAFFIC_PROGRAMS,
     };
+    use crate::capture::{CaptureFeatures, CaptureModule, CaptureProfile};
+    use crate::config::CoreConfig;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
+    use std::sync::mpsc;
 
     #[test]
     fn event_layout_matches_c_abi() {
@@ -729,5 +1058,74 @@ mod tests {
         assert_eq!(parsed.domain, "example.com");
         assert_eq!(parsed.addresses, vec!["93.184.216.34"]);
         assert_eq!(parsed.ttl_secs, 60);
+    }
+
+    #[test]
+    fn profile_program_counts_match_the_modular_link_budget() {
+        let count = |features: CaptureFeatures| {
+            usize::from(features.contains(CaptureModule::Process)) * PROCESS_PROGRAMS.len()
+                + usize::from(features.contains(CaptureModule::Connections))
+                    * CONNECTION_PROGRAMS.len()
+                + usize::from(
+                    features.contains(CaptureModule::Traffic)
+                        || features.contains(CaptureModule::Dns),
+                ) * TRAFFIC_PROGRAMS.len()
+                + usize::from(features.contains(CaptureModule::Files)) * FILE_PROGRAMS.len()
+        };
+
+        assert_eq!(count(CaptureProfile::Process.features()), 2);
+        assert_eq!(count(CaptureProfile::Connections.features()), 6);
+        assert_eq!(count(CaptureProfile::Network.features()), 18);
+        assert_eq!(count(CaptureProfile::Security.features()), 19);
+        assert!(TRAFFIC_PROGRAMS
+            .iter()
+            .all(|program| !program.starts_with("tracelens_dns_")));
+    }
+
+    #[test]
+    fn capture_scope_is_encoded_for_bpf_maps() {
+        let global = kernel_capture_config(&crate::CaptureScope::Global);
+        assert_eq!(global.scope_mode, SCOPE_GLOBAL);
+
+        let pid = kernel_capture_config(&crate::CaptureScope::Process(4242));
+        assert_eq!(pid.scope_mode, SCOPE_PID);
+        assert_eq!(pid.target_pid, 4242);
+
+        let name = kernel_capture_config(&crate::CaptureScope::ProcessName(
+            "very-long-process-name".to_owned(),
+        ));
+        assert_eq!(name.scope_mode, SCOPE_COMM);
+        assert_eq!(&name.target_comm[..15], b"very-long-proce");
+        assert_eq!(name.target_comm[15], 0);
+    }
+
+    #[test]
+    fn only_known_dns_resolvers_are_scope_dependencies() {
+        assert!(is_dns_dependency_name("systemd-resolve"));
+        assert!(is_dns_dependency_name("dnsmasq"));
+        assert!(!is_dns_dependency_name("curl"));
+    }
+
+    #[test]
+    fn controller_reports_attach_failure_and_can_return_to_idle() {
+        let (sender, _receiver) = mpsc::channel();
+        let config = CoreConfig {
+            bpf_object_dir: PathBuf::from("definitely-missing-bpf-objects"),
+            ..CoreConfig::default()
+        };
+        let runtime = KernelRuntimeController::spawn(config, sender);
+
+        assert_eq!(runtime.status().state, KernelRuntimeState::Idle);
+        assert!(runtime
+            .apply_plan(
+                CaptureProfile::Process.features(),
+                crate::CaptureScope::Global,
+            )
+            .is_err());
+        assert_eq!(runtime.status().state, KernelRuntimeState::Failed);
+        let stopped = runtime.stop().expect("stop failed runtime");
+        assert_eq!(stopped.state, KernelRuntimeState::Idle);
+        assert_eq!(stopped.link_count, 0);
+        runtime.shutdown();
     }
 }

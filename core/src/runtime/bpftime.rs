@@ -16,6 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tracelens_events::TraceEvent;
 
+use super::provider::{TlsCapability, TlsProvider};
 use super::ProbeKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +46,7 @@ const TLS_SPECS: &[ProbeSpec] = &[
         companion_retprobe: false,
     },
     ProbeSpec {
-        object_file: "tls.o",
+        object_file: "openssl.o",
         program_name: "tracelens_tls_servername",
         function_name: "SSL_get_servername",
         retprobe: true,
@@ -53,7 +54,7 @@ const TLS_SPECS: &[ProbeSpec] = &[
         companion_retprobe: false,
     },
     ProbeSpec {
-        object_file: "tls.o",
+        object_file: "openssl.o",
         program_name: "tracelens_tls_version",
         function_name: "SSL_get_version",
         retprobe: true,
@@ -61,7 +62,7 @@ const TLS_SPECS: &[ProbeSpec] = &[
         companion_retprobe: false,
     },
     ProbeSpec {
-        object_file: "tls.o",
+        object_file: "openssl.o",
         program_name: "tracelens_tls_fd",
         function_name: "SSL_get_fd",
         retprobe: true,
@@ -69,7 +70,7 @@ const TLS_SPECS: &[ProbeSpec] = &[
         companion_retprobe: false,
     },
     ProbeSpec {
-        object_file: "tls.o",
+        object_file: "openssl.o",
         program_name: "tracelens_tls_set_fd",
         function_name: "SSL_set_fd",
         retprobe: false,
@@ -79,7 +80,7 @@ const TLS_SPECS: &[ProbeSpec] = &[
 ];
 const PLAINTEXT_SPECS: &[ProbeSpec] = &[
     ProbeSpec {
-        object_file: "plaintext.o",
+        object_file: "openssl.o",
         program_name: "tracelens_plaintext_read_enter",
         function_name: "SSL_read",
         retprobe: false,
@@ -87,48 +88,196 @@ const PLAINTEXT_SPECS: &[ProbeSpec] = &[
         companion_retprobe: true,
     },
     ProbeSpec {
-        object_file: "plaintext.o",
+        object_file: "openssl.o",
         program_name: "tracelens_plaintext_write",
         function_name: "SSL_write",
         retprobe: false,
         companion_program_name: None,
         companion_retprobe: false,
     },
-];
-const HTTP_SPECS: &[ProbeSpec] = &[
     ProbeSpec {
-        object_file: "http.o",
-        program_name: "tracelens_http_read_enter",
-        function_name: "SSL_read",
+        object_file: "openssl.o",
+        program_name: "tracelens_plaintext_read_ex_enter",
+        function_name: "SSL_read_ex",
         retprobe: false,
-        companion_program_name: Some("tracelens_http_read_exit"),
+        companion_program_name: Some("tracelens_plaintext_read_ex_exit"),
         companion_retprobe: true,
     },
     ProbeSpec {
-        object_file: "http.o",
-        program_name: "tracelens_http_write",
-        function_name: "SSL_write",
+        object_file: "openssl.o",
+        program_name: "tracelens_plaintext_write_ex_enter",
+        function_name: "SSL_write_ex",
+        retprobe: false,
+        companion_program_name: Some("tracelens_plaintext_write_ex_exit"),
+        companion_retprobe: true,
+    },
+];
+const GNUTLS_TLS_SPECS: &[ProbeSpec] = &[
+    ProbeSpec {
+        object_file: "gnutls.o",
+        program_name: "tracelens_gnutls_handshake",
+        function_name: "gnutls_handshake",
+        retprobe: false,
+        companion_program_name: None,
+        companion_retprobe: false,
+    },
+    ProbeSpec {
+        object_file: "gnutls.o",
+        program_name: "tracelens_gnutls_set_fd",
+        function_name: "gnutls_transport_set_int2",
+        retprobe: false,
+        companion_program_name: None,
+        companion_retprobe: false,
+    },
+    ProbeSpec {
+        object_file: "gnutls.o",
+        program_name: "tracelens_gnutls_server_name_set",
+        function_name: "gnutls_server_name_set",
+        retprobe: false,
+        companion_program_name: None,
+        companion_retprobe: false,
+    },
+    ProbeSpec {
+        object_file: "gnutls.o",
+        program_name: "tracelens_gnutls_protocol_enter",
+        function_name: "gnutls_protocol_get_version",
+        retprobe: false,
+        companion_program_name: Some("tracelens_gnutls_protocol_exit"),
+        companion_retprobe: true,
+    },
+];
+const GNUTLS_PLAINTEXT_SPECS: &[ProbeSpec] = &[
+    ProbeSpec {
+        object_file: "gnutls.o",
+        program_name: "tracelens_gnutls_recv_enter",
+        function_name: "gnutls_record_recv",
+        retprobe: false,
+        companion_program_name: Some("tracelens_gnutls_recv_exit"),
+        companion_retprobe: true,
+    },
+    ProbeSpec {
+        object_file: "gnutls.o",
+        program_name: "tracelens_gnutls_send_enter",
+        function_name: "gnutls_record_send",
+        retprobe: false,
+        companion_program_name: Some("tracelens_gnutls_send_exit"),
+        companion_retprobe: true,
+    },
+];
+const NSS_TLS_SPECS: &[ProbeSpec] = &[
+    ProbeSpec {
+        object_file: "nss.o",
+        program_name: "tracelens_nss_import_fd",
+        function_name: "SSL_ImportFD",
+        retprobe: true,
+        companion_program_name: None,
+        companion_retprobe: false,
+    },
+    ProbeSpec {
+        object_file: "nss.o",
+        program_name: "tracelens_nss_set_url",
+        function_name: "SSL_SetURL",
+        retprobe: false,
+        companion_program_name: None,
+        companion_retprobe: false,
+    },
+    ProbeSpec {
+        object_file: "nss.o",
+        program_name: "tracelens_nss_channel_info_enter",
+        function_name: "SSL_GetChannelInfo",
+        retprobe: false,
+        companion_program_name: Some("tracelens_nss_channel_info_exit"),
+        companion_retprobe: true,
+    },
+];
+const NSS_PLAINTEXT_SPECS: &[ProbeSpec] = &[
+    ProbeSpec {
+        object_file: "nss.o",
+        program_name: "tracelens_nspr_read_enter",
+        function_name: "PR_Read",
+        retprobe: false,
+        companion_program_name: Some("tracelens_nspr_read_exit"),
+        companion_retprobe: true,
+    },
+    ProbeSpec {
+        object_file: "nss.o",
+        program_name: "tracelens_nspr_write_enter",
+        function_name: "PR_Write",
+        retprobe: false,
+        companion_program_name: Some("tracelens_nspr_write_exit"),
+        companion_retprobe: true,
+    },
+    ProbeSpec {
+        object_file: "nss.o",
+        program_name: "tracelens_nspr_close",
+        function_name: "PR_Close",
         retprobe: false,
         companion_program_name: None,
         companion_retprobe: false,
     },
 ];
-
+const RUSTLS_TLS_SPECS: &[ProbeSpec] = &[ProbeSpec {
+    object_file: "rustls.o",
+    program_name: "tracelens_rustls_process_packets",
+    function_name: "rustls_connection_process_new_packets",
+    retprobe: false,
+    companion_program_name: None,
+    companion_retprobe: false,
+}];
+const RUSTLS_PLAINTEXT_SPECS: &[ProbeSpec] = &[
+    ProbeSpec {
+        object_file: "rustls.o",
+        program_name: "tracelens_rustls_read_enter",
+        function_name: "rustls_connection_read",
+        retprobe: false,
+        companion_program_name: Some("tracelens_rustls_read_exit"),
+        companion_retprobe: true,
+    },
+    ProbeSpec {
+        object_file: "rustls.o",
+        program_name: "tracelens_rustls_write_enter",
+        function_name: "rustls_connection_write",
+        retprobe: false,
+        companion_program_name: Some("tracelens_rustls_write_exit"),
+        companion_retprobe: true,
+    },
+];
 pub fn probe_specs(probe: ProbeKind) -> &'static [ProbeSpec] {
     match probe {
         ProbeKind::Tls => TLS_SPECS,
-        ProbeKind::Http => HTTP_SPECS,
+        ProbeKind::Http => &[],
         ProbeKind::Plaintext => PLAINTEXT_SPECS,
     }
 }
 
+pub fn provider_probe_specs(provider: TlsProvider, probe: ProbeKind) -> &'static [ProbeSpec] {
+    match provider {
+        TlsProvider::GnuTls => match probe {
+            ProbeKind::Tls => GNUTLS_TLS_SPECS,
+            ProbeKind::Plaintext => GNUTLS_PLAINTEXT_SPECS,
+            ProbeKind::Http => &[],
+        },
+        TlsProvider::Nss => match probe {
+            ProbeKind::Tls => NSS_TLS_SPECS,
+            ProbeKind::Plaintext => NSS_PLAINTEXT_SPECS,
+            ProbeKind::Http => &[],
+        },
+        TlsProvider::Rustls => match probe {
+            ProbeKind::Tls => RUSTLS_TLS_SPECS,
+            ProbeKind::Plaintext => RUSTLS_PLAINTEXT_SPECS,
+            ProbeKind::Http => &[],
+        },
+        TlsProvider::OpenSsl | TlsProvider::BoringSsl | TlsProvider::LibreSsl => probe_specs(probe),
+        _ => &[],
+    }
+}
+
 #[derive(Debug)]
-struct ManagedAttachment {
+struct ManagedProvider {
     key: String,
     target: String,
-    pid: u32,
-    probe: ProbeKind,
-    hook: String,
+    attachments: Vec<BpftimeAttachment>,
+    link_count: usize,
     child: Child,
     reader: Option<JoinHandle<()>>,
 }
@@ -147,7 +296,7 @@ pub struct BpftimeRuntime {
     loader_executable: Option<PathBuf>,
     version: Option<String>,
     detail: String,
-    managed: Vec<ManagedAttachment>,
+    managed: Vec<ManagedProvider>,
     event_sender: Option<Sender<TraceEvent>>,
 }
 
@@ -240,37 +389,39 @@ impl BpftimeRuntime {
     pub fn attachments(&self) -> Vec<BpftimeAttachment> {
         self.managed
             .iter()
-            .map(|attachment| BpftimeAttachment {
-                target: attachment.target.clone(),
-                pid: attachment.pid,
-                probe: attachment.probe,
-                hook: attachment.hook.clone(),
-            })
+            .flat_map(|provider| provider.attachments.iter().cloned())
             .collect()
     }
 
-    pub fn attach(
+    pub fn attach_provider(
         &mut self,
         target: &str,
         pid: u32,
-        probe: ProbeKind,
-        spec: ProbeSpec,
+        capability: &TlsCapability,
+        requests: &[(ProbeKind, ProbeSpec)],
         object_dir: &Path,
-    ) -> Result<BpftimeAttachment, String> {
+    ) -> Result<Vec<BpftimeAttachment>, String> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
         if !self.is_available() {
             return Err(self.detail.clone());
         }
-        let target_info = resolve_user_ssl_target(pid)?;
-        let object_path = resolve_object_path(object_dir, spec.object_file)?;
-        let key = attachment_key(target, pid, probe, spec.function_name);
-        if self.managed.iter().any(|attachment| attachment.key == key) {
-            return Ok(BpftimeAttachment {
+        let object_file = requests[0].1.object_file;
+        let object_path = resolve_object_path(object_dir, object_file)?;
+        let key = provider_key(capability.provider, target, pid, &capability.build_id);
+        if let Some(provider) = self.managed.iter().find(|provider| provider.key == key) {
+            return Ok(provider.attachments.clone());
+        }
+        let attachments = requests
+            .iter()
+            .map(|(probe, spec)| BpftimeAttachment {
                 target: target.to_owned(),
                 pid,
-                probe,
+                probe: *probe,
                 hook: spec.function_name.to_owned(),
-            });
-        }
+            })
+            .collect::<Vec<_>>();
 
         let loader = self
             .loader_executable
@@ -287,22 +438,22 @@ impl BpftimeRuntime {
             .args(["--pid", &pid.to_string(), "--object"])
             .arg(&object_path)
             .args(["--library"])
-            .arg(&target_info.library)
-            .args([
-                "--function",
-                spec.function_name,
-                "--program",
+            .arg(&capability.library);
+        let mut link_count = 0;
+        for (_, spec) in requests {
+            command.arg("--attach").arg(encode_loader_attachment(
                 spec.program_name,
-            ]);
-        if spec.retprobe {
-            command.arg("--retprobe");
-        }
-        if let Some(companion_program_name) = spec.companion_program_name {
-            command
-                .arg("--companion-program")
-                .arg(companion_program_name);
-            if spec.companion_retprobe {
-                command.arg("--companion-retprobe");
+                spec.function_name,
+                spec.retprobe,
+            ));
+            link_count += 1;
+            if let Some(companion_program_name) = spec.companion_program_name {
+                command.arg("--attach").arg(encode_loader_attachment(
+                    companion_program_name,
+                    spec.function_name,
+                    spec.companion_retprobe,
+                ));
+                link_count += 1;
             }
         }
         if self.event_sender.is_some() {
@@ -323,6 +474,8 @@ impl BpftimeRuntime {
             return Err(format!("bpftime trace exited before attaching: {status}"));
         }
 
+        let provider_name = capability.provider.to_string();
+        let provider_library = capability.library.display().to_string();
         let reader = child.stdout.take().map(|stdout| {
             let sender = self.event_sender.clone();
             thread::spawn(move || {
@@ -333,61 +486,63 @@ impl BpftimeRuntime {
                     let Ok(line) = line else {
                         break;
                     };
-                    if let Ok(event) = serde_json::from_str::<TraceEvent>(&line) {
+                    if let Ok(mut event) = serde_json::from_str::<TraceEvent>(&line) {
+                        if let Some(instrumentation) = event.instrumentation.as_mut() {
+                            instrumentation.provider.clone_from(&provider_name);
+                            instrumentation.library.clone_from(&provider_library);
+                        }
                         let _ = sender.send(event);
                     }
                 }
             })
         });
 
-        self.managed.push(ManagedAttachment {
+        self.managed.push(ManagedProvider {
             key,
             target: target.to_owned(),
-            pid,
-            probe,
-            hook: spec.function_name.to_owned(),
+            attachments: attachments.clone(),
+            link_count,
             child,
             reader,
         });
-        Ok(BpftimeAttachment {
-            target: target.to_owned(),
-            pid,
-            probe,
-            hook: spec.function_name.to_owned(),
-        })
-    }
-
-    pub fn detach(&mut self, target: &str, pid: u32, probe: ProbeKind, hook: &str) {
-        let key = attachment_key(target, pid, probe, hook);
-        let mut retained = Vec::with_capacity(self.managed.len());
-        for mut attachment in self.managed.drain(..) {
-            if attachment.key == key {
-                stop_attachment(&mut attachment);
-            } else {
-                retained.push(attachment);
-            }
-        }
-        self.managed = retained;
+        Ok(attachments)
     }
 
     pub fn detach_target(&mut self, target: &str) {
-        let prefix = format!("{target}::");
         let mut retained = Vec::with_capacity(self.managed.len());
-        for mut attachment in self.managed.drain(..) {
-            if attachment.key.starts_with(&prefix) {
-                stop_attachment(&mut attachment);
+        for mut provider in self.managed.drain(..) {
+            if provider.target == target {
+                stop_provider(&mut provider);
             } else {
-                retained.push(attachment);
+                retained.push(provider);
             }
         }
         self.managed = retained;
+    }
+
+    pub fn provider_count(&self) -> usize {
+        self.managed.len()
+    }
+
+    pub fn reader_count(&self) -> usize {
+        self.managed
+            .iter()
+            .filter(|provider| provider.reader.is_some())
+            .count()
+    }
+
+    pub fn link_count(&self) -> usize {
+        self.managed
+            .iter()
+            .map(|provider| provider.link_count)
+            .sum()
     }
 }
 
 impl Drop for BpftimeRuntime {
     fn drop(&mut self) {
-        for attachment in &mut self.managed {
-            stop_attachment(attachment);
+        for provider in &mut self.managed {
+            stop_provider(provider);
         }
     }
 }
@@ -526,15 +681,43 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn stop_attachment(attachment: &mut ManagedAttachment) {
-    stop_child(&mut attachment.child);
-    if let Some(reader) = attachment.reader.take() {
+fn stop_provider(provider: &mut ManagedProvider) {
+    stop_child(&mut provider.child);
+    if let Some(reader) = provider.reader.take() {
         let _ = reader.join();
     }
 }
 
-fn attachment_key(target: &str, pid: u32, probe: ProbeKind, hook: &str) -> String {
-    format!("{target}::{pid}::{probe}::{hook}")
+fn provider_key(provider: TlsProvider, target: &str, pid: u32, build_id: &str) -> String {
+    format!("{provider}::{build_id}::{target}::{pid}")
+}
+
+fn encode_loader_attachment(program: &str, function: &str, retprobe: bool) -> String {
+    format!("{program},{function},{}", u8::from(retprobe))
+}
+
+pub fn provider_build_id(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("cannot read provider {}: {error}", path.display()))?;
+    for offset in 0..bytes.len().saturating_sub(16) {
+        let namesz = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let descsz = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let note_type = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap());
+        if namesz != 4 || note_type != 3 || !(4..=64).contains(&descsz) {
+            continue;
+        }
+        if bytes.get(offset + 12..offset + 16) != Some(b"GNU\0".as_slice()) {
+            continue;
+        }
+        let end = offset + 16 + descsz as usize;
+        let Some(build_id) = bytes.get(offset + 16..end) else {
+            continue;
+        };
+        return Ok(build_id.iter().map(|byte| format!("{byte:02x}")).collect());
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("cannot stat provider {}: {error}", path.display()))?;
+    Ok(format!("fallback-{}", metadata.len()))
 }
 
 fn discover(candidate: &Path) -> Result<(PathBuf, String), String> {
@@ -564,40 +747,121 @@ fn discover(candidate: &Path) -> Result<(PathBuf, String), String> {
     } else {
         candidate.to_owned()
     };
+    let help = Command::new(candidate)
+        .arg("--help")
+        .output()
+        .map_err(|error| {
+            format!(
+                "cannot inspect {} capabilities: {error}",
+                candidate.display()
+            )
+        })?;
+    let help_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    if !help_text.split_whitespace().any(|word| word == "trace") {
+        return Err(format!(
+            "{} does not provide the trace command required by the current TraceLens adapter",
+            candidate.display()
+        ));
+    }
     Ok((executable, version))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{attachment_key, probe_specs, resolve_user_target, BpftimeRuntime};
+    use super::{
+        probe_specs, provider_build_id, provider_key, provider_probe_specs, resolve_user_target,
+        BpftimeRuntime,
+    };
+    use crate::runtime::provider::TlsProvider;
     use crate::runtime::ProbeKind;
 
     #[test]
-    fn attachment_keys_are_target_pid_probe_and_hook_scoped() {
+    fn provider_keys_are_build_and_target_scoped() {
         assert_eq!(
-            attachment_key("process:42", 42, ProbeKind::Tls, "SSL_connect"),
-            "process:42::42::tls::SSL_connect"
+            provider_key(TlsProvider::OpenSsl, "process:42", 42, "abc123"),
+            "OpenSSL::abc123::process:42::42"
         );
     }
 
     #[test]
-    fn tls_dependency_expands_to_openssl_and_tls_objects() {
+    fn current_executable_has_a_stable_provider_identity() {
+        let executable = std::env::current_exe().expect("current executable");
+        let first = provider_build_id(&executable).expect("provider identity");
+        let second = provider_build_id(&executable).expect("provider identity");
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+    }
+
+    #[test]
+    fn tls_dependency_uses_the_unified_openssl_object() {
         let specs = probe_specs(ProbeKind::Tls);
         assert_eq!(specs.len(), 5);
-        assert_eq!(specs[0].object_file, "openssl.o");
+        assert!(specs.iter().all(|spec| spec.object_file == "openssl.o"));
         assert_eq!(specs[1].function_name, "SSL_get_servername");
     }
 
     #[test]
-    fn http_dependency_uses_a_private_bounded_capture_object() {
-        let specs = probe_specs(ProbeKind::Http);
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].object_file, "http.o");
+    fn plaintext_dependency_uses_the_unified_openssl_object() {
+        let specs = probe_specs(ProbeKind::Plaintext);
+        assert_eq!(specs.len(), 4);
+        assert!(specs.iter().all(|spec| spec.object_file == "openssl.o"));
         assert_eq!(
             specs[0].companion_program_name,
-            Some("tracelens_http_read_exit")
+            Some("tracelens_plaintext_read_exit")
         );
         assert_eq!(specs[1].function_name, "SSL_write");
+        assert_eq!(specs[2].function_name, "SSL_read_ex");
+        assert_eq!(specs[3].function_name, "SSL_write_ex");
+    }
+
+    #[test]
+    fn gnutls_catalog_uses_the_provider_specific_record_api() {
+        let tls = provider_probe_specs(TlsProvider::GnuTls, ProbeKind::Tls);
+        let plaintext = provider_probe_specs(TlsProvider::GnuTls, ProbeKind::Plaintext);
+        assert!(tls
+            .iter()
+            .chain(plaintext)
+            .all(|spec| spec.object_file == "gnutls.o"));
+        assert!(plaintext
+            .iter()
+            .any(|spec| spec.function_name == "gnutls_record_recv"));
+        assert!(plaintext
+            .iter()
+            .any(|spec| spec.function_name == "gnutls_record_send"));
+    }
+
+    #[test]
+    fn nss_catalog_tracks_imported_descriptors_before_nspr_io() {
+        let tls = provider_probe_specs(TlsProvider::Nss, ProbeKind::Tls);
+        let plaintext = provider_probe_specs(TlsProvider::Nss, ProbeKind::Plaintext);
+        assert_eq!(tls[0].function_name, "SSL_ImportFD");
+        assert!(plaintext.iter().any(|spec| spec.function_name == "PR_Read"));
+        assert!(plaintext
+            .iter()
+            .any(|spec| spec.function_name == "PR_Write"));
+        assert!(plaintext
+            .iter()
+            .any(|spec| spec.function_name == "PR_Close"));
+        assert!(tls
+            .iter()
+            .chain(plaintext)
+            .all(|spec| spec.object_file == "nss.o"));
+    }
+
+    #[test]
+    fn rustls_ffi_catalog_uses_stable_connection_functions() {
+        let tls = provider_probe_specs(TlsProvider::Rustls, ProbeKind::Tls);
+        let plaintext = provider_probe_specs(TlsProvider::Rustls, ProbeKind::Plaintext);
+        assert_eq!(
+            tls[0].function_name,
+            "rustls_connection_process_new_packets"
+        );
+        assert_eq!(plaintext[0].function_name, "rustls_connection_read");
+        assert_eq!(plaintext[1].function_name, "rustls_connection_write");
     }
 
     #[test]

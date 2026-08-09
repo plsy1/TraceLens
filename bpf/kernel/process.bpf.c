@@ -1,4 +1,5 @@
 #include "common.h"
+#include "capture_filter.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -9,6 +10,10 @@ static __always_inline int emit_process_event(__u16 event_type)
 {
     struct tracelens_process_event *event;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    if (!capture_matches_current()) {
+        return 0;
+    }
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event) {

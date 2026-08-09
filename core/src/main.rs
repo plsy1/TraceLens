@@ -1,7 +1,7 @@
 use std::env;
-use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex, TryLockError};
+use std::sync::{mpsc, Arc, Mutex, TryLockError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracelens_core::{config::CliOptions, Core};
 
@@ -11,6 +11,10 @@ fn main() {
     if options.help {
         print_help();
         return;
+    }
+
+    if options.desktop_child {
+        configure_desktop_lifetime();
     }
 
     if options.observe {
@@ -42,28 +46,41 @@ fn print_help() {
          Options:\n\
            --config <PATH>          Select a configuration file (reserved)\n\
            --observe                Load kernel probes and serve the capture API (starts idle)\n\
+           --desktop-child          Stop automatically when the desktop parent exits\n\
            --api-listen <ADDR>      API listen address (default: 127.0.0.1:8080)\n\
            --bpf-object-dir <PATH>  Directory containing compiled BPF objects\n\
            --storage <MODE>         Event storage: memory (default) or sqlite\n\
            --database <PATH>        Enable SQLite history at PATH\n\
            --memory-event-limit N   Maximum events retained in memory (default: 50000)\n\
-           --default-observation-level N  Baseline L1-L5 for all processes (default: 1)\n\
            --print-example-event   Print the shared event schema as JSON\n\
            -h, --help              Show this help\n"
     );
 }
 
+#[cfg(target_os = "linux")]
+fn configure_desktop_lifetime() {
+    // pkexec preserves the desktop process as the parent of the elevated Core.
+    // Ask the kernel to terminate Core if the GUI crashes or exits without
+    // running its normal cleanup path, so uprobe links cannot be orphaned.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+    }
+    if unsafe { libc::getppid() } == 1 {
+        std::process::exit(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_desktop_lifetime() {}
+
 fn run_observer(options: CliOptions) {
     let config = options.config;
-    let capture_gate = Arc::new(AtomicBool::new(false));
     let core = match Core::open(config.clone()) {
         Ok(mut core) => {
             // The observer process starts as an armed tool, not an always-on
-            // dashboard. Kernel tracepoints may be loaded below, but Core
-            // will discard their events until the UI presses Start.
+            // dashboard. Kernel probes remain detached until Start.
             core.enable_observer_capture_mode();
             core.stop_capture();
-            core.set_capture_gate(Arc::clone(&capture_gate));
             Arc::new(Mutex::new(core))
         }
         Err(error) => {
@@ -75,18 +92,10 @@ fn run_observer(options: CliOptions) {
 
     if let Ok(mut core) = core.lock() {
         core.set_probe_event_sender(sender.clone());
+        core.set_kernel_runtime(
+            tracelens_core::runtime::kernel::KernelRuntimeController::spawn(config.clone(), sender),
+        );
     }
-
-    let observer_config = config.clone();
-    thread::spawn(move || {
-        if let Err(error) = tracelens_core::runtime::kernel::KernelRuntime::run(
-            &observer_config,
-            sender,
-            capture_gate,
-        ) {
-            eprintln!("kernel observer stopped: {error}");
-        }
-    });
 
     let api_core = Arc::clone(&core);
     let api_listen = options.api_listen;
@@ -101,10 +110,17 @@ fn run_observer(options: CliOptions) {
     println!("API: http://{api_listen}");
 
     const EVENT_BATCH_LIMIT: usize = 256;
-    while let Ok(first_event) = receiver.recv() {
+    let mut last_userspace_refresh = Instant::now();
+    loop {
         let mut events = Vec::with_capacity(EVENT_BATCH_LIMIT);
-        events.push(first_event);
-        events.extend(receiver.try_iter().take(EVENT_BATCH_LIMIT - 1));
+        match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(first_event) => {
+                events.push(first_event);
+                events.extend(receiver.try_iter().take(EVENT_BATCH_LIMIT - 1));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
         let core_guard = loop {
             match core.try_lock() {
                 Ok(core) => break Some(core),
@@ -115,6 +131,10 @@ fn run_observer(options: CliOptions) {
         if let Some(mut core) = core_guard {
             for event in events {
                 core.ingest_event(event);
+            }
+            if last_userspace_refresh.elapsed() >= Duration::from_secs(2) {
+                core.refresh_userspace_probes();
+                last_userspace_refresh = Instant::now();
             }
         }
         thread::yield_now();

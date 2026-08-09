@@ -1,17 +1,13 @@
 # TraceLens eBPF layer
 
-This directory contains the probe-side boundary. The process, network, TCP
-state/byte, and DNS probes emit the current Phase 2/3/4 metadata events;
-userspace probe objects are loaded and attached on demand by the Phase 7
-runtime. OpenSSL/TLS objects emit Phase 8 metadata records through their own
-ring buffers. The Phase 10 HTTP object is attached at L4 and uses a separate
-bounded `SSL_read`/`SSL_write` capture ABI; Core parses the bytes and drops the
-raw capture. The Phase 9 plaintext object is only attached at L5: it pairs the
-same entry/return probes and caps each persisted plaintext record at 16 KiB.
+This directory contains the probe-side boundary. Kernel objects are attached
+only while a capture is active and only for its selected modules. Userspace
+objects provide OpenSSL-family, GnuTLS, NSS/NSPR, and rustls-ffi metadata,
+bounded HTTP reconstruction input, and explicit bounded Plaintext capture.
 
 ```text
-kernel/       always-on process, network, DNS, TCP, and file probes
-userspace/    on-demand OpenSSL, TLS, HTTP, and plaintext probes
+kernel/       on-demand process, network/socket-I/O/DNS, and file probes
+userspace/    on-demand OpenSSL, GnuTLS, NSS/NSPR, and rustls-ffi objects
 include/      shared C event ABI and probe helpers
 ```
 
@@ -39,18 +35,21 @@ cmake -S . -B build -DTRACELENS_BUILD_BPF=ON
 cmake --build build
 ```
 
-process.bpf.c emits exec/exit records, network.bpf.c emits connect/close/state/
-byte records, and dns.bpf.c emits bounded UDP/TCP DNS query/response payloads
-through ring buffers. DNS socket tracking covers sendto/recvfrom,
-sendmsg/recvmsg, connected read/write, and close cleanup. The Rust loader reads
-the resulting process.o, network.o, and dns.o objects from build/bpf/objects.
+`process.bpf.c` emits exec/exit records. `network.bpf.c` owns connection state
+and one shared set of send/recv/read/write hooks; `dns_helpers.h` adds bounded
+UDP/TCP DNS query/response handling to those same hooks. A feature map disables
+Traffic or DNS work when its module is off. `file.bpf.c` is completely optional.
+The Rust controller loads `process.o`, `network.o`, and `file.o` according to
+the immutable CapturePlan and drops them on Stop.
 
-Phase 7 builds `target/debug/tracelens-bpftime-loader` alongside the Core
-binary. When `bpftime` is available, Core starts `bpftime trace` with that
-loader and passes the target PID, resolved ELF/libssl path, object path, and
-symbol. Without bpftime, Core uses the same object and symbol metadata through
-libbpf's real kernel uProbe attach API. The TLS objects emit metadata through a
-ring buffer consumed by Core. The HTTP and plaintext objects use bounded
-directional records; Core correlates them through the SSL object and current
-TLS session. HTTP capture records are an internal derivation input and are not
-written to the event store.
+`openssl.o` contains TLS metadata plus bounded `SSL_read/write` and
+`SSL_read_ex/write_ex` programs. `gnutls.o` covers `gnutls_handshake`, transport
+fd, and bounded `gnutls_record_recv/send`. `nss.o` shares one TLS-object
+allowlist across `libssl3` and `libnspr4`, while `rustls.o` targets the stable
+dynamic rustls-ffi connection API. A Provider instance is keyed by TLS
+implementation, ELF build-id, and target scope; it owns one loaded object, all
+available selected-symbol links, and one ring-buffer reader. When `bpftime` is
+available, Core passes the complete hook set to one loader process. Otherwise
+the same plan uses libbpf kernel uProbe attachment. Core derives HTTP from the
+bounded payload stream and only retains raw fragments when Plaintext was
+explicitly selected.
