@@ -5,6 +5,7 @@
 //! probes or bpftime are attached.
 
 pub mod api;
+pub mod capture;
 pub mod config;
 pub mod detection;
 pub mod dns;
@@ -19,11 +20,8 @@ pub mod storage;
 pub mod tls;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 
+use capture::{CaptureFeatures, CaptureModule, CapturePlan, CaptureProfile};
 use config::{CoreConfig, StorageMode};
 use detection::{Alert, DetectionEngine, RiskScore};
 use dns::DnsTracker;
@@ -35,7 +33,8 @@ use http::{HttpMessage, HttpTracker, PayloadDecision};
 use network::ConnectionTracker;
 use observation::ObservationManager;
 use process::{read_process_ref, ProcessTracker};
-use runtime::{ProbeAttachment, ProbeRuntime, RuntimeStatus};
+use runtime::kernel::{KernelRuntimeController, KernelRuntimeStatus};
+use runtime::{ProbeAttachment, ProbeRuntime, RuntimeStatus, UserspaceProbeDiagnostics};
 use storage::{EventQuery, EventStore};
 use tls::TlsTracker;
 use tracelens_events::{
@@ -93,9 +92,10 @@ pub struct Core {
     alerts: Vec<Alert>,
     capture_state: CaptureState,
     capture_scope: CaptureScope,
+    capture_plan: CapturePlan,
     observer_capture_mode: bool,
     capture_started_at_ns: Option<u64>,
-    capture_gate: Option<Arc<AtomicBool>>,
+    kernel_runtime: Option<KernelRuntimeController>,
 }
 
 impl Core {
@@ -148,9 +148,10 @@ impl Core {
             // to Stopped before exposing the capture controls.
             capture_state: CaptureState::Capturing,
             capture_scope: CaptureScope::Global,
+            capture_plan: CapturePlan::network(CaptureScope::Global),
             observer_capture_mode: false,
             capture_started_at_ns: None,
-            capture_gate: None,
+            kernel_runtime: None,
         }
     }
 
@@ -174,25 +175,27 @@ impl Core {
         &self.capture_scope
     }
 
+    pub fn capture_plan(&self) -> &CapturePlan {
+        &self.capture_plan
+    }
+
+    pub fn configure_capture(
+        &mut self,
+        profile: CaptureProfile,
+        requested: Option<CaptureFeatures>,
+    ) -> Result<&CapturePlan, String> {
+        if self.observer_capture_mode && self.is_capturing() {
+            return Err("stop the active capture before changing modules".to_owned());
+        }
+        self.capture_plan = CapturePlan::resolve(self.capture_scope.clone(), profile, requested)?;
+        Ok(&self.capture_plan)
+    }
+
     /// Enable the live observer boundary. The library constructor leaves this
     /// off so deterministic callers can use synthetic timestamps; the CLI
     /// enables it so queued kernel events from before Start are discarded.
     pub fn enable_observer_capture_mode(&mut self) {
         self.observer_capture_mode = true;
-    }
-
-    /// Connect the live observer's event gate to the Core lifecycle. Kernel
-    /// tracepoints may remain loaded for fast Start, but callbacks must be
-    /// silent while the tool is stopped.
-    pub fn set_capture_gate(&mut self, gate: Arc<AtomicBool>) {
-        gate.store(self.is_capturing(), Ordering::Release);
-        self.capture_gate = Some(gate);
-    }
-
-    fn update_capture_gate(&self) {
-        if let Some(gate) = &self.capture_gate {
-            gate.store(self.is_capturing(), Ordering::Release);
-        }
     }
 
     pub fn probe_attachments(&self) -> Vec<ProbeAttachment> {
@@ -201,6 +204,22 @@ impl Core {
 
     pub fn probe_errors(&self) -> &[String] {
         self.probe_runtime.errors()
+    }
+
+    pub fn userspace_probe_diagnostics(&self) -> UserspaceProbeDiagnostics {
+        self.probe_runtime.diagnostics()
+    }
+
+    pub fn tls_capabilities(&self) -> &[runtime::provider::TlsCapability] {
+        self.probe_runtime.capabilities()
+    }
+
+    pub fn set_kernel_runtime(&mut self, runtime: KernelRuntimeController) {
+        self.kernel_runtime = Some(runtime);
+    }
+
+    pub fn kernel_runtime_status(&self) -> Option<KernelRuntimeStatus> {
+        self.kernel_runtime.as_ref().map(|runtime| runtime.status())
     }
 
     pub fn event_bus(&self) -> &EventBus {
@@ -349,10 +368,54 @@ impl Core {
             })
             .collect::<Vec<_>>();
         records.sort_by(|left, right| {
-            right
-                .last_seen_ns
-                .cmp(&left.last_seen_ns)
-                .then_with(|| right.connection.id.cmp(&left.connection.id))
+            let ordering = match filter.sort_by {
+                crate::events::ConnectionTimelineSort::Route => {
+                    let route = |record: &&crate::network::ConnectionRecord| {
+                        let process = record
+                            .process
+                            .as_ref()
+                            .and_then(|process| process.executable.as_deref())
+                            .unwrap_or("");
+                        let remote = record
+                            .connection
+                            .domain
+                            .as_deref()
+                            .unwrap_or(&record.connection.remote.address);
+                        format!("{process}\0{remote}\0{:05}", record.connection.remote.port)
+                    };
+                    route(left).cmp(&route(right))
+                }
+                crate::events::ConnectionTimelineSort::State => format!(
+                    "{:?}\0{:?}",
+                    left.connection.tcp_state, left.connection.state
+                )
+                .cmp(&format!(
+                    "{:?}\0{:?}",
+                    right.connection.tcp_state, right.connection.state
+                )),
+                crate::events::ConnectionTimelineSort::Details => left
+                    .connection
+                    .sent_bytes
+                    .saturating_add(left.connection.received_bytes)
+                    .cmp(
+                        &right
+                            .connection
+                            .sent_bytes
+                            .saturating_add(right.connection.received_bytes),
+                    ),
+                crate::events::ConnectionTimelineSort::Id => {
+                    left.connection.id.cmp(&right.connection.id)
+                }
+                crate::events::ConnectionTimelineSort::LastSeen => {
+                    left.last_seen_ns.cmp(&right.last_seen_ns)
+                }
+            };
+            let ordering = if filter.sort_descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            ordering.then_with(|| left.connection.id.cmp(&right.connection.id))
         });
 
         let total = records.len();
@@ -495,6 +558,10 @@ impl Core {
             return;
         }
         if !self.event_matches_capture_scope(&event) {
+            self.apply_dns_dependency_event(&event);
+            return;
+        }
+        if self.observer_capture_mode && !self.capture_module_accepts(event.kind) {
             return;
         }
         self.expire_observations();
@@ -503,10 +570,7 @@ impl Core {
             return;
         }
         let can_derive_http = !self.observer_capture_mode
-            || event
-                .pid
-                .map(|pid| self.effective_process_level(pid) >= observation::ObservationLevel::L4)
-                .unwrap_or(false);
+            || self.capture_plan.effective.contains(CaptureModule::Http);
         let derived_http_events = if can_derive_http {
             self.derive_http_events(&event)
         } else {
@@ -514,16 +578,15 @@ impl Core {
         };
         self.apply_payload_policy(&mut event);
 
-        // L4 uses the bounded plaintext probe internally to reconstruct HTTP
-        // messages. Keep those chunks private to the reassembler; L5 is the
-        // level that explicitly exposes raw plaintext. Library callers feed
-        // synthetic events directly and keep the historical event semantics.
+        // HTTP and Plaintext share the bounded SSL payload transport. Keep
+        // chunks private to the HTTP reassembler unless Plaintext was also
+        // selected. Library callers keep their historical event semantics.
         let retain_plaintext = event.kind != EventKind::Plaintext
             || !self.observer_capture_mode
-            || event
-                .pid
-                .map(|pid| self.effective_process_level(pid) >= observation::ObservationLevel::L5)
-                .unwrap_or(false);
+            || self
+                .capture_plan
+                .effective
+                .contains(CaptureModule::Plaintext);
         let persist_input = event.kind != EventKind::HttpCapture
             && retain_plaintext
             && (!matches!(event.kind, EventKind::FileOpen | EventKind::FileRead)
@@ -539,6 +602,57 @@ impl Core {
             self.evaluate_event(&http_event);
             self.store.insert(http_event.clone());
             self.event_bus.publish(http_event);
+        }
+    }
+
+    fn capture_module_accepts(&self, kind: EventKind) -> bool {
+        let features = self.capture_plan.effective;
+        match kind {
+            EventKind::ProcessExec | EventKind::ProcessExit => {
+                features.contains(CaptureModule::Process)
+            }
+            EventKind::TcpConnect | EventKind::TcpClose | EventKind::TcpStateChanged => {
+                features.contains(CaptureModule::Connections)
+            }
+            EventKind::TcpBytes => features.contains(CaptureModule::Traffic),
+            EventKind::DnsQuery | EventKind::DnsResponse => features.contains(CaptureModule::Dns),
+            EventKind::TlsMetadata => features.contains(CaptureModule::Tls),
+            EventKind::Plaintext | EventKind::HttpCapture => {
+                features.contains(CaptureModule::Http)
+                    || features.contains(CaptureModule::Plaintext)
+            }
+            EventKind::Http => features.contains(CaptureModule::Http),
+            EventKind::FileOpen | EventKind::FileRead => features.contains(CaptureModule::Files),
+            EventKind::ObservationChanged => false,
+        }
+    }
+
+    fn apply_dns_dependency_event(&mut self, event: &TraceEvent) {
+        if event.kind != EventKind::DnsResponse
+            || !self.capture_plan.effective.contains(CaptureModule::Dns)
+            || !event
+                .pid
+                .is_some_and(runtime::kernel::is_dns_dependency_pid)
+        {
+            return;
+        }
+        let EventPayload::Dns {
+            protocol: _,
+            domain,
+            addresses,
+            ttl_secs,
+        } = &event.payload
+        else {
+            return;
+        };
+        self.dns.observe_response(
+            domain.clone(),
+            addresses.clone(),
+            *ttl_secs,
+            event.timestamp_ns,
+        );
+        if !addresses.is_empty() {
+            self.connections.set_domain_for_addresses(addresses, domain);
         }
     }
 
@@ -865,6 +979,7 @@ impl Core {
                 http_event.id = format!("{}-http-{sequence}", event.id);
                 http_event.process = event.process.clone();
                 http_event.connection = event.connection.clone();
+                http_event.instrumentation = event.instrumentation.clone();
                 http_event
             })
             .collect()
@@ -1089,7 +1204,8 @@ impl Core {
                 CaptureScope::Global => {}
             }
         }
-        self.capture_scope = scope;
+        self.capture_scope = scope.clone();
+        self.capture_plan.target = scope;
         if self.is_capturing() {
             self.probe_runtime.detach_all();
             self.sync_capture_scope();
@@ -1101,31 +1217,46 @@ impl Core {
     /// global or process-name selector can attach immediately, even though
     /// their exec event happened before the button was pressed.
     pub fn start_capture(&mut self) -> CaptureState {
-        if !self.is_capturing() {
-            self.capture_state = CaptureState::Capturing;
-            self.capture_started_at_ns = self.observer_capture_mode.then(monotonic_now_ns);
-            self.sync_capture_scope();
-            self.update_capture_gate();
-        }
+        let _ = self.try_start_capture();
         self.capture_state
+    }
+
+    pub fn try_start_capture(&mut self) -> Result<CaptureState, String> {
+        if !self.is_capturing() {
+            let started_at_ns = self.observer_capture_mode.then(monotonic_now_ns);
+            if let Some(runtime) = &self.kernel_runtime {
+                runtime.apply_plan(self.capture_plan.effective, self.capture_scope.clone())?;
+            }
+            self.capture_state = CaptureState::Capturing;
+            self.capture_started_at_ns = started_at_ns;
+            self.sync_capture_scope();
+        }
+        Ok(self.capture_state)
     }
 
     /// Stop the current capture session and release userspace hooks. Existing
     /// events remain available for inspection; Reset is the command that
     /// discards them.
     pub fn stop_capture(&mut self) -> CaptureState {
+        let _ = self.try_stop_capture();
+        self.capture_state
+    }
+
+    pub fn try_stop_capture(&mut self) -> Result<CaptureState, String> {
         self.capture_state = CaptureState::Stopped;
         self.capture_started_at_ns = None;
-        self.update_capture_gate();
         self.probe_runtime.detach_all();
-        self.capture_state
+        if let Some(runtime) = &self.kernel_runtime {
+            runtime.stop()?;
+        }
+        Ok(self.capture_state)
     }
 
     /// Discard all current-capture state and immediately start a new capture.
     /// Observation rules are retained because they describe what the next
     /// capture should inspect.
     pub fn reset_capture(&mut self) -> Result<CaptureState, String> {
-        self.stop_capture();
+        self.try_stop_capture()?;
         self.store.clear()?;
         self.event_bus = EventBus::new();
         self.correlator = EventCorrelator::new();
@@ -1136,7 +1267,7 @@ impl Core {
         self.http = HttpTracker::default();
         self.detection = DetectionEngine::default();
         self.alerts.clear();
-        Ok(self.start_capture())
+        self.try_start_capture()
     }
 
     fn sync_observation_target(&mut self, target: observation::ObservationTarget) {
@@ -1172,12 +1303,37 @@ impl Core {
         let process_pids = self.process_pids_for_target(target);
         self.probe_runtime.detach_target(&target_name);
         if level > observation::ObservationLevel::L1 {
+            let features = CaptureFeatures::legacy_level(level as u8)
+                .expect("ObservationLevel always has a compatibility mapping");
             self.probe_runtime
-                .set_level(&target_name, level, &process_pids);
+                .set_features(&target_name, features, &process_pids);
         }
     }
 
     fn sync_process_observation(&mut self, pid: u32) {
+        if self.observer_capture_mode {
+            if !self.is_capturing() {
+                return;
+            }
+            let target_name = format!("process:{pid}");
+            if !self.process_in_capture_scope(pid) {
+                self.probe_runtime.detach_target(&target_name);
+                return;
+            }
+            if matches!(
+                self.capture_scope,
+                CaptureScope::Global | CaptureScope::ProcessName(_)
+            ) {
+                return;
+            }
+            let features = self.capture_plan.effective;
+            if !self.probe_runtime.matches_features(&target_name, features) {
+                self.probe_runtime.detach_target(&target_name);
+                self.probe_runtime
+                    .set_features(&target_name, features, &[pid]);
+            }
+            return;
+        }
         let target = observation::ObservationTarget::Process(pid);
         let level = self.effective_process_level(pid);
         if self.is_capturing() {
@@ -1190,9 +1346,11 @@ impl Core {
                 }
                 if matches!(self.capture_scope, CaptureScope::Global)
                     && level <= self.observations.default_level()
-                    && self
-                        .probe_runtime
-                        .matches_level("global", self.observations.default_level())
+                    && self.probe_runtime.matches_features(
+                        "global",
+                        CaptureFeatures::legacy_level(self.observations.default_level() as u8)
+                            .expect("ObservationLevel compatibility mapping"),
+                    )
                 {
                     // Global capture already has one all-process probe set.
                     // Do not add a second per-PID set when a process exec event
@@ -1200,7 +1358,9 @@ impl Core {
                     return;
                 }
                 let target_name = target.to_string();
-                if !self.probe_runtime.matches_level(&target_name, level) {
+                let features = CaptureFeatures::legacy_level(level as u8)
+                    .expect("ObservationLevel compatibility mapping");
+                if !self.probe_runtime.matches_features(&target_name, features) {
                     self.sync_observation_probes(&target, level);
                 }
             } else {
@@ -1215,14 +1375,75 @@ impl Core {
         }
     }
 
+    /// Re-scan userspace TLS providers while a capture is active. This covers
+    /// targets that call dlopen after exec and targets that are quiet between
+    /// loading their TLS library and making the first record-layer call.
+    pub fn refresh_userspace_probes(&mut self) {
+        let features = self.capture_plan.effective;
+        if !self.is_capturing()
+            || !(features.contains(CaptureModule::Tls)
+                || features.contains(CaptureModule::Http)
+                || features.contains(CaptureModule::Plaintext))
+        {
+            return;
+        }
+        match self.capture_scope.clone() {
+            CaptureScope::Global => {
+                self.probe_runtime.set_features("global", features, &[]);
+            }
+            CaptureScope::Process(pid) => {
+                self.probe_runtime
+                    .set_features(&format!("process:{pid}"), features, &[pid]);
+            }
+            CaptureScope::ProcessName(name) => {
+                self.probe_runtime
+                    .set_features(&format!("process-name:{name}"), features, &[]);
+            }
+        }
+    }
+
     fn sync_capture_scope(&mut self) {
+        if self.observer_capture_mode {
+            let features = self.capture_plan.effective;
+            match self.capture_scope.clone() {
+                CaptureScope::Global => {
+                    self.discover_running_processes();
+                    self.probe_runtime.detach_target("global");
+                    self.probe_runtime.set_features("global", features, &[]);
+                }
+                CaptureScope::Process(pid) => {
+                    self.discover_process(pid);
+                    let target = format!("process:{pid}");
+                    self.probe_runtime.detach_target(&target);
+                    self.probe_runtime.set_features(&target, features, &[pid]);
+                }
+                CaptureScope::ProcessName(name) => {
+                    for process in self
+                        .available_processes()
+                        .into_iter()
+                        .filter(|process| process.executable.as_deref() == Some(name.as_str()))
+                    {
+                        self.processes.observe(
+                            process.clone(),
+                            process.start_time_ns.unwrap_or_else(monotonic_now_ns),
+                        );
+                    }
+                    let target = format!("process-name:{name}");
+                    self.probe_runtime.detach_target(&target);
+                    self.probe_runtime.set_features(&target, features, &[]);
+                }
+            }
+            return;
+        }
         match self.capture_scope.clone() {
             CaptureScope::Global => {
                 let pids = self.discover_running_processes();
                 self.probe_runtime.detach_target("global");
                 let default_level = self.observations.default_level();
                 if default_level > observation::ObservationLevel::L1 {
-                    self.probe_runtime.set_level("global", default_level, &[]);
+                    let features = CaptureFeatures::legacy_level(default_level as u8)
+                        .expect("ObservationLevel compatibility mapping");
+                    self.probe_runtime.set_features("global", features, &[]);
                 }
                 for pid in pids {
                     if self.effective_process_level(pid) > default_level {

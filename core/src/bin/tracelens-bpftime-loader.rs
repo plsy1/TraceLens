@@ -21,11 +21,14 @@ struct Options {
     pid: u32,
     object: PathBuf,
     library: PathBuf,
+    attachments: Vec<AttachmentOption>,
+}
+
+#[derive(Debug)]
+struct AttachmentOption {
     function: String,
     program: String,
     retprobe: bool,
-    companion_program: Option<String>,
-    companion_retprobe: bool,
 }
 
 fn main() {
@@ -44,13 +47,14 @@ fn run() -> Result<(), String> {
     let mut object = open_object
         .load()
         .map_err(|error| format!("failed to load {}: {error}", options.object.display()))?;
-    let attach_program = |object: &mut libbpf_rs::Object, program_name: &str, retprobe: bool| {
+    let attach_program = |object: &mut libbpf_rs::Object, attachment: &AttachmentOption| {
         let program = object
             .progs_mut()
-            .find(|program| program.name() == OsStr::new(program_name))
+            .find(|program| program.name() == OsStr::new(&attachment.program))
             .ok_or_else(|| {
                 format!(
-                    "program `{program_name}` is missing from {}",
+                    "program `{}` is missing from {}",
+                    attachment.program,
                     options.object.display()
                 )
             })?;
@@ -60,31 +64,23 @@ fn run() -> Result<(), String> {
                 &options.library,
                 0,
                 UprobeOpts {
-                    func_name: Some(options.function.clone()),
-                    retprobe,
+                    func_name: Some(attachment.function.clone()),
+                    retprobe: attachment.retprobe,
                     ..Default::default()
                 },
             )
             .map_err(|error| {
                 format!(
                     "failed to attach {} to {} for pid {}: {error}",
-                    options.function,
+                    attachment.function,
                     options.library.display(),
                     options.pid
                 )
             })
     };
-    let mut _links = vec![attach_program(
-        &mut object,
-        &options.program,
-        options.retprobe,
-    )?];
-    if let Some(companion_program) = options.companion_program.as_deref() {
-        _links.push(attach_program(
-            &mut object,
-            companion_program,
-            options.companion_retprobe,
-        )?);
+    let mut _links = Vec::new();
+    for attachment in &options.attachments {
+        _links.push(attach_program(&mut object, attachment)?);
     }
 
     if let Some(events) = object.maps().find(|map| map.name() == OsStr::new("events")) {
@@ -105,8 +101,8 @@ fn run() -> Result<(), String> {
             .map_err(|error| format!("failed to build event ring buffer: {error}"))?;
 
         eprintln!(
-            "attached {} to {} for pid {}",
-            options.function,
+            "attached {} OpenSSL hooks to {} for pid {}",
+            options.attachments.len(),
             options.library.display(),
             options.pid
         );
@@ -118,8 +114,8 @@ fn run() -> Result<(), String> {
     }
 
     eprintln!(
-        "attached {} to {} for pid {}",
-        options.function,
+        "attached {} OpenSSL hooks to {} for pid {}",
+        options.attachments.len(),
         options.library.display(),
         options.pid
     );
@@ -143,7 +139,7 @@ struct UserTlsEvent {
     timestamp_ns: u64,
     ssl_object: u64,
     fd: i32,
-    _reserved: u32,
+    api_id: u32,
     sni: [u8; TLS_NAME_LEN],
     version: [u8; TLS_VERSION_LEN],
 }
@@ -176,17 +172,20 @@ fn decode_tls_event(data: &[u8], source: EventSource) -> Option<TraceEvent> {
     if event.event_type != EVENT_TLS_METADATA || event.pid == 0 {
         return None;
     }
-    Some(TraceEvent::tls_metadata(
-        source,
-        event.pid,
-        TlsEventData {
-            ssl_object: event.ssl_object,
-            fd: (event.fd >= 0).then_some(event.fd),
-            sni: bytes_to_string(&event.sni),
-            version: bytes_to_string(&event.version),
-        },
-        event.timestamp_ns,
-    ))
+    Some(
+        TraceEvent::tls_metadata(
+            source,
+            event.pid,
+            TlsEventData {
+                ssl_object: event.ssl_object,
+                fd: (event.fd >= 0).then_some(event.fd),
+                sni: bytes_to_string(&event.sni),
+                version: bytes_to_string(&event.version),
+            },
+            event.timestamp_ns,
+        )
+        .with_instrumentation("unknown", "", event.api_id as u16),
+    )
 }
 
 fn decode_plaintext_event(data: &[u8], source: EventSource) -> Option<TraceEvent> {
@@ -194,26 +193,29 @@ fn decode_plaintext_event(data: &[u8], source: EventSource) -> Option<TraceEvent
     if event.event_type != EVENT_PLAINTEXT || event.pid == 0 {
         return None;
     }
-    let direction = match event.direction {
+    let direction = match event.direction & 0xff {
         1 => PlaintextDirection::Read,
         2 => PlaintextDirection::Write,
         _ => return None,
     };
     let payload_size = usize::try_from(event.payload_size).ok()?;
     let captured_size = payload_size.min(PLAINTEXT_MAX_LEN);
-    Some(TraceEvent::plaintext(
-        source,
-        event.pid,
-        PlaintextEventData {
-            ssl_object: event.ssl_object,
-            fd: (event.fd >= 0).then_some(event.fd),
-            direction,
-            data: String::from_utf8_lossy(&event.payload[..captured_size]).into_owned(),
-            bytes: payload_size,
-            truncated: event.truncated != 0 || payload_size > PLAINTEXT_MAX_LEN,
-        },
-        event.timestamp_ns,
-    ))
+    Some(
+        TraceEvent::plaintext(
+            source,
+            event.pid,
+            PlaintextEventData {
+                ssl_object: event.ssl_object,
+                fd: (event.fd >= 0).then_some(event.fd),
+                direction,
+                data: String::from_utf8_lossy(&event.payload[..captured_size]).into_owned(),
+                bytes: payload_size,
+                truncated: event.truncated != 0 || payload_size > PLAINTEXT_MAX_LEN,
+            },
+            event.timestamp_ns,
+        )
+        .with_instrumentation("unknown", "", event.direction >> 8),
+    )
 }
 
 fn read_u16(data: &[u8]) -> Option<u16> {
@@ -243,11 +245,7 @@ impl Options {
         let mut pid = None;
         let mut object = None;
         let mut library = None;
-        let mut function = None;
-        let mut program = None;
-        let mut retprobe = false;
-        let mut companion_program = None;
-        let mut companion_retprobe = false;
+        let mut attachments = Vec::new();
         while let Some(argument) = args.next() {
             let value = |name: &str, args: &mut dyn Iterator<Item = String>| {
                 args.next()
@@ -263,15 +261,9 @@ impl Options {
                 }
                 "--object" => object = Some(PathBuf::from(value("--object", &mut args)?)),
                 "--library" => library = Some(PathBuf::from(value("--library", &mut args)?)),
-                "--function" => function = Some(value("--function", &mut args)?),
-                "--program" => program = Some(value("--program", &mut args)?),
-                "--retprobe" => retprobe = true,
-                "--companion-program" => {
-                    companion_program = Some(value("--companion-program", &mut args)?)
-                }
-                "--companion-retprobe" => companion_retprobe = true,
+                "--attach" => attachments.push(parse_attachment(&value("--attach", &mut args)?)?),
                 "-h" | "--help" => {
-                    println!("Usage: tracelens-bpftime-loader --pid PID --object PATH --library PATH --function SYMBOL --program NAME [--retprobe] [--companion-program NAME] [--companion-retprobe]");
+                    println!("Usage: tracelens-bpftime-loader --pid PID --object PATH --library PATH --attach PROGRAM,FUNCTION,0|1 [--attach ...]");
                     std::process::exit(0);
                 }
                 unknown => return Err(format!("unknown argument `{unknown}`")),
@@ -281,11 +273,43 @@ impl Options {
             pid: pid.ok_or_else(|| "--pid is required".to_owned())?,
             object: object.ok_or_else(|| "--object is required".to_owned())?,
             library: library.ok_or_else(|| "--library is required".to_owned())?,
-            function: function.ok_or_else(|| "--function is required".to_owned())?,
-            program: program.ok_or_else(|| "--program is required".to_owned())?,
-            retprobe,
-            companion_program,
-            companion_retprobe,
+            attachments: (!attachments.is_empty())
+                .then_some(attachments)
+                .ok_or_else(|| "at least one --attach is required".to_owned())?,
         })
+    }
+}
+
+fn parse_attachment(value: &str) -> Result<AttachmentOption, String> {
+    let mut fields = value.split(',');
+    let program = fields.next().unwrap_or_default();
+    let function = fields.next().unwrap_or_default();
+    let retprobe = fields.next().unwrap_or_default();
+    if program.is_empty() || function.is_empty() || fields.next().is_some() {
+        return Err("--attach must be PROGRAM,FUNCTION,0|1".to_owned());
+    }
+    let retprobe = match retprobe {
+        "0" => false,
+        "1" => true,
+        _ => return Err("--attach retprobe flag must be 0 or 1".to_owned()),
+    };
+    Ok(AttachmentOption {
+        function: function.to_owned(),
+        program: program.to_owned(),
+        retprobe,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_attachment;
+
+    #[test]
+    fn grouped_attachment_argument_preserves_program_symbol_and_kind() {
+        let attachment = parse_attachment("read_exit,SSL_read,1").expect("attachment");
+        assert_eq!(attachment.program, "read_exit");
+        assert_eq!(attachment.function, "SSL_read");
+        assert!(attachment.retprobe);
+        assert!(parse_attachment("bad").is_err());
     }
 }

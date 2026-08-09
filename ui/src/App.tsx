@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 type Summary = {
   processes: number;
   connections: number;
   domains: number;
-  observation_level: string;
+  capture_profile: CaptureProfile;
+  capture_modules: CaptureModule[];
   capture_state: "stopped" | "capturing";
   capture_target: string;
   event_count: number;
@@ -16,6 +18,19 @@ type ProcessCandidate = {
   command_line: string | null;
 };
 
+type TlsCapability = {
+  provider: string;
+  library: string;
+  version_hint: string | null;
+  symbols: string[];
+  supported: boolean;
+  reason: string | null;
+};
+
+type RuntimeHealth = {
+  tls_capabilities: TlsCapability[];
+};
+
 type ProcessRow = {
   pid: number;
   name: string;
@@ -23,7 +38,6 @@ type ProcessRow = {
   connections: number;
   sent_bytes: number;
   received_bytes: number;
-  level: string;
   risk_score?: number;
 };
 
@@ -55,6 +69,9 @@ type TimelineEntry = {
   id: string;
   timestamp_ns: number;
   source: string;
+  tls_provider?: string | null;
+  tls_library?: string | null;
+  tls_api_function?: string | null;
   kind: string;
   pid: number | null;
   process_name: string | null;
@@ -144,18 +161,31 @@ type Snapshot = {
   mode: "demo" | "live";
 };
 
-const API_BASE = import.meta.env.VITE_CORE_API_URL ?? "";
+const IS_DESKTOP = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const API_BASE = import.meta.env.VITE_CORE_API_URL ?? (IS_DESKTOP ? "http://127.0.0.1:8080" : "");
 const PROCESS_PAGE_SIZE = 8;
 const CONNECTION_PAGE_SIZE = 20;
 const TIMELINE_PAGE_SIZE = 50;
 
 type SortDirection = "asc" | "desc";
-type ProcessSortKey = "name" | "pid" | "connections" | "traffic" | "level";
+type ProcessSortKey = "name" | "pid" | "connections" | "traffic";
 type ConnectionSortKey = "process" | "pid" | "remote" | "domain" | "state" | "traffic" | "last_seen";
-type ProcessColumnKey = ProcessSortKey | "inspect";
+type ProcessColumnKey = ProcessSortKey;
 type ConnectionColumnKey = ConnectionSortKey | "trace";
 type SessionColumnKey = "route" | "state" | "details" | "id" | "inspect";
+type SessionSortKey = Exclude<SessionColumnKey, "inspect"> | "last_seen";
 type WorkspaceView = "processes" | "connections" | "sessions" | "timeline";
+
+type DesktopStatus = {
+  core_ready: boolean;
+  managed_by_desktop: boolean;
+  api_url: string;
+  message: string;
+};
+
+type DesktopBootState =
+  | { phase: "browser" | "starting" | "ready"; message: string }
+  | { phase: "error"; message: string };
 
 type SortState<Key extends string> = {
   key: Key;
@@ -187,6 +217,40 @@ type CaptureTargetSelection = {
   name?: string;
 };
 
+type CaptureProfile = "process" | "connections" | "network" | "web" | "security" | "custom";
+type CaptureModule = "process" | "connections" | "traffic" | "dns" | "files" | "tls" | "http" | "plaintext";
+
+const captureProfiles: Array<{ id: CaptureProfile; label: string; modules: CaptureModule[] }> = [
+  { id: "process", label: "Process", modules: ["process"] },
+  { id: "connections", label: "Connections", modules: ["process", "connections"] },
+  { id: "network", label: "Network", modules: ["process", "connections", "traffic", "dns"] },
+  { id: "web", label: "Web", modules: ["process", "connections", "traffic", "dns", "tls", "http"] },
+  { id: "security", label: "Security", modules: ["process", "connections", "traffic", "dns", "tls", "files"] },
+  { id: "custom", label: "Custom", modules: [] },
+];
+
+const captureModuleOptions: Array<{ id: CaptureModule; label: string; hint: string }> = [
+  { id: "process", label: "Process lifecycle", hint: "exec and exit" },
+  { id: "connections", label: "Connections", hint: "TCP endpoints and state" },
+  { id: "traffic", label: "Traffic counters", hint: "sent and received bytes" },
+  { id: "dns", label: "DNS", hint: "queries and domain correlation" },
+  { id: "tls", label: "TLS metadata", hint: "provider, SNI and version" },
+  { id: "http", label: "HTTP", hint: "metadata and bounded text preview" },
+  { id: "plaintext", label: "Plaintext", hint: "sensitive raw TLS payload" },
+  { id: "files", label: "File activity", hint: "openat security context" },
+];
+
+function closeModuleDependencies(modules: CaptureModule[]): CaptureModule[] {
+  const selected = new Set(modules);
+  if (selected.size > 0) selected.add("process");
+  if (selected.has("traffic") || selected.has("dns") || selected.has("tls")) selected.add("connections");
+  if (selected.has("http") || selected.has("plaintext")) {
+    selected.add("tls");
+    selected.add("connections");
+  }
+  return captureModuleOptions.map(({ id }) => id).filter((module) => selected.has(module));
+}
+
 const workspaceTabs: Array<{ id: WorkspaceView; label: string; hint: string }> = [
   { id: "connections", label: "Connections", hint: "network edges" },
   { id: "processes", label: "Processes", hint: "live inventory" },
@@ -199,8 +263,6 @@ const defaultProcessColumnWidths: Record<ProcessColumnKey, number> = {
   pid: 90,
   connections: 110,
   traffic: 120,
-  level: 120,
-  inspect: 180,
 };
 
 const defaultConnectionColumnWidths: Record<ConnectionColumnKey, number> = {
@@ -226,17 +288,18 @@ const demoSummary: Summary = {
   processes: 4,
   connections: 54,
   domains: 31,
-  observation_level: "L1",
+  capture_profile: "network",
+  capture_modules: ["process", "connections", "traffic", "dns"],
   capture_state: "capturing",
   capture_target: "global",
   event_count: 3,
 };
 
 const demoProcesses: ProcessRow[] = [
-  { name: "chrome", pid: 4821, connections: 48, sent_bytes: 1_200_000, received_bytes: 1_600_000, level: "L1", command_line: null },
-  { name: "curl", pid: 12345, connections: 1, sent_bytes: 8_000, received_bytes: 10_432, level: "L1", command_line: "curl https://example.com" },
-  { name: "python3", pid: 9172, connections: 3, sent_bytes: 500_000_000, received_bytes: 0, level: "L3", command_line: "python3 uploader.py" },
-  { name: "sshd", pid: 1061, connections: 2, sent_bytes: 0, received_bytes: 0, level: "L1", command_line: null },
+  { name: "chrome", pid: 4821, connections: 48, sent_bytes: 1_200_000, received_bytes: 1_600_000, command_line: null },
+  { name: "curl", pid: 12345, connections: 1, sent_bytes: 8_000, received_bytes: 10_432, command_line: "curl https://example.com" },
+  { name: "python3", pid: 9172, connections: 3, sent_bytes: 500_000_000, received_bytes: 0, command_line: "python3 uploader.py" },
+  { name: "sshd", pid: 1061, connections: 2, sent_bytes: 0, received_bytes: 0, command_line: null },
 ];
 
 const demoConnections: ConnectionRow[] = [
@@ -326,13 +389,20 @@ function buildTimelinePath(kind: string, pid: string, connectionId: string, offs
   return `/api/timeline?${params.toString()}`;
 }
 
-function buildConnectionTimelinePath(offset: number, includeClosed: boolean, includePlaintext: boolean): string {
+function buildConnectionTimelinePath(
+  offset: number,
+  includeClosed: boolean,
+  includePlaintext: boolean,
+  sort: SortState<SessionSortKey>,
+): string {
   const params = new URLSearchParams({
     limit: "20",
     offset: String(offset),
     include_closed: String(includeClosed),
     include_events: "false",
     include_plaintext: String(includePlaintext),
+    sort: sort.key,
+    direction: sort.direction,
   });
   return `/api/connection-timeline?${params.toString()}`;
 }
@@ -457,6 +527,31 @@ function SortableHeader<Key extends string>({
   );
 }
 
+function SessionSortableHeader({
+  label,
+  column,
+  sort,
+  onSort,
+  onResizeStart,
+}: {
+  label: string;
+  column: Exclude<SessionColumnKey, "inspect">;
+  sort: SortState<SessionSortKey>;
+  onSort: (column: Exclude<SessionColumnKey, "inspect">) => void;
+  onResizeStart: (clientX: number) => void;
+}) {
+  const active = sort.key === column;
+  return (
+    <div className="session-header-cell" aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
+      <button type="button" className={`sort-button ${active ? "active" : ""}`} onClick={() => onSort(column)}>
+        <span>{label}</span>
+        <span className="sort-indicator" aria-hidden="true">{active ? (sort.direction === "asc" ? "↑" : "↓") : "↕"}</span>
+      </button>
+      <ColumnResizer label={label} onResizeStart={onResizeStart} />
+    </div>
+  );
+}
+
 function TablePagination({
   pageIndex,
   pageCount,
@@ -508,6 +603,11 @@ function timelineKindLabel(kind: string): string {
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+}
+
+function tlsProvenance(entry: TimelineEntry): string | null {
+  if (!entry.tls_provider) return null;
+  return `${entry.tls_provider}${entry.tls_api_function ? ` · ${entry.tls_api_function}` : ""}`;
 }
 
 function timelineDetail(entry: TimelineEntry): string {
@@ -582,6 +682,9 @@ function payloadBytes(entry: TimelineEntry): number | null {
 }
 
 function App() {
+  const [desktopBoot, setDesktopBoot] = useState<DesktopBootState>(() => IS_DESKTOP
+    ? { phase: "starting", message: "Waiting for administrator authorization…" }
+    : { phase: "browser", message: "" });
   const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot);
   const [refreshing, setRefreshing] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -593,17 +696,17 @@ function App() {
   const [timelinePid, setTimelinePid] = useState("");
   const [timelineConnectionInput, setTimelineConnectionInput] = useState("");
   const [timelineConnection, setTimelineConnection] = useState("");
-  const [observationBusyPid, setObservationBusyPid] = useState<number | null>(null);
-  const [observationError, setObservationError] = useState<string | null>(null);
   const [processCandidates, setProcessCandidates] = useState<ProcessCandidate[]>([]);
   const [captureTargetMode, setCaptureTargetMode] = useState<"pid" | "name" | "global">("pid");
   const [capturePidInput, setCapturePidInput] = useState("");
   const [captureNameInput, setCaptureNameInput] = useState("");
-  const [captureLevel, setCaptureLevel] = useState("L4");
+  const [captureProfile, setCaptureProfile] = useState<CaptureProfile>("network");
+  const [captureModules, setCaptureModules] = useState<CaptureModule[]>(["process", "connections", "traffic", "dns"]);
   const [captureBusy, setCaptureBusy] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [captureWorkspaceActive, setCaptureWorkspaceActive] = useState(false);
+  const [tlsCapabilities, setTlsCapabilities] = useState<TlsCapability[]>([]);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [connectionEventsLoadingId, setConnectionEventsLoadingId] = useState<string | null>(null);
   const [selectedPayloadEntry, setSelectedPayloadEntry] = useState<TimelineEntry | null>(null);
@@ -614,6 +717,7 @@ function App() {
   const [connectionColumnWidths, setConnectionColumnWidths] = useState<Record<ConnectionColumnKey, number>>(defaultConnectionColumnWidths);
   const [connectionTimelineOffset, setConnectionTimelineOffset] = useState(0);
   const [sessionColumnWidths, setSessionColumnWidths] = useState<Record<SessionColumnKey, number>>(defaultSessionColumnWidths);
+  const [sessionSort, setSessionSort] = useState<SortState<SessionSortKey>>({ key: "last_seen", direction: "desc" });
   const [connectionPageIndex, setConnectionPageIndex] = useState(0);
   const [timelineOffset, setTimelineOffset] = useState(0);
   const [selectedConnectionCache, setSelectedConnectionCache] = useState<ConnectionTimeline | null>(null);
@@ -625,6 +729,25 @@ function App() {
   const sessionListRef = useRef<HTMLDivElement>(null);
   const timelineListRef = useRef<HTMLDivElement>(null);
   const pendingScrollSnapshotRef = useRef<ScrollSnapshot | null>(null);
+
+  const startDesktopCore = useCallback(async () => {
+    if (!IS_DESKTOP) return;
+    setDesktopBoot({ phase: "starting", message: "Waiting for administrator authorization…" });
+    try {
+      const status = await invoke<DesktopStatus>("ensure_core");
+      if (!status.core_ready) throw new Error(status.message);
+      setDesktopBoot({ phase: "ready", message: status.message });
+    } catch (error) {
+      setDesktopBoot({
+        phase: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    void startDesktopCore();
+  }, [startDesktopCore]);
 
   const beginProcessColumnResize = useCallback((column: ProcessColumnKey, clientX: number) => {
     columnResizeCleanupRef.current?.();
@@ -766,8 +889,8 @@ function App() {
     [showPlaintextFragments, timelineConnection, timelineKind, timelineOffset, timelinePid],
   );
   const connectionTimelineRequestPath = useMemo(
-    () => buildConnectionTimelinePath(connectionTimelineOffset, showClosedConnections, showPlaintextFragments),
-    [connectionTimelineOffset, showClosedConnections, showPlaintextFragments],
+    () => buildConnectionTimelinePath(connectionTimelineOffset, showClosedConnections, showPlaintextFragments, sessionSort),
+    [connectionTimelineOffset, sessionSort, showClosedConnections, showPlaintextFragments],
   );
 
   const refresh = useCallback(async () => {
@@ -778,19 +901,23 @@ function App() {
     try {
       const needsCandidates = snapshot.mode !== "live"
         || (snapshot.summary.capture_state === "stopped" && !captureWorkspaceActive);
-      const [summary, processes, connections, connectionTimeline, timeline, candidates] = await Promise.all([
+      const needsTlsDiagnostics = snapshot.summary.capture_state === "capturing" || captureWorkspaceActive;
+      const [summary, processes, connections, connectionTimeline, timeline, candidates, health] = await Promise.all([
         fetchJson<Summary>("/api/summary"),
         activeView === "processes" ? fetchJson<ProcessRow[]>("/api/processes") : Promise.resolve(null),
         activeView === "connections" ? fetchJson<ConnectionRow[]>("/api/connections") : Promise.resolve(null),
         activeView === "sessions" ? fetchJson<ConnectionTimelinePage>(connectionTimelineRequestPath) : Promise.resolve(null),
         activeView === "timeline" ? fetchJson<TimelinePage>(timelineRequestPath) : Promise.resolve(null),
         needsCandidates ? fetchJson<ProcessCandidate[]>('/api/process-candidates') : Promise.resolve(null),
+        needsTlsDiagnostics ? fetchJson<RuntimeHealth>('/api/health') : Promise.resolve(null),
       ]);
       // Capture immediately before replacing the live lists so a user who
       // scrolls while the API is responding does not get pulled back to an
       // older position.
       pendingScrollSnapshotRef.current = captureScrollSnapshot();
       if (candidates) setProcessCandidates(candidates);
+      if (health) setTlsCapabilities(health.tls_capabilities);
+      else if (!needsTlsDiagnostics) setTlsCapabilities([]);
       setSnapshot((current) => ({
         ...current,
         summary,
@@ -891,31 +1018,33 @@ function App() {
     }
   }, []);
 
-  const setGlobalObservationLevel = useCallback(async (level: string) => {
-    setCaptureError(null);
-    try {
-      const numericLevel = Number(level.replace(/^L/i, ""));
-      if (!Number.isInteger(numericLevel) || numericLevel < 1 || numericLevel > 5) {
-        throw new Error("invalid observation level");
+  const chooseCaptureProfile = useCallback((profile: CaptureProfile) => {
+    setCaptureProfile(profile);
+    if (profile === "custom") return;
+    const preset = captureProfiles.find((candidate) => candidate.id === profile);
+    if (preset) setCaptureModules(preset.modules);
+  }, []);
+
+  const toggleCaptureModule = useCallback((module: CaptureModule, enabled: boolean) => {
+    setCaptureProfile("custom");
+    setCaptureModules((current) => {
+      const next = new Set(current);
+      if (enabled) {
+        next.add(module);
+      } else {
+        next.delete(module);
+        if (module === "process") next.clear();
+        if (module === "connections") {
+          ["traffic", "dns", "tls", "http", "plaintext"].forEach((item) => next.delete(item as CaptureModule));
+        }
+        if (module === "tls") {
+          next.delete("http");
+          next.delete("plaintext");
+        }
       }
-      await postCommand("/api/observations/default", { level: numericLevel });
-      const captureTarget = snapshot.mode === "live" ? snapshot.summary.capture_target : "global";
-      if (captureTarget !== "global") {
-        // The default level is only a baseline; an earlier exact target
-        // override (for example process-name:curl at L4) would otherwise
-        // keep HTTP/plaintext probes attached after selecting L3.
-        await postCommand("/api/observations", {
-          target: captureTarget,
-          level: numericLevel,
-          exact: true,
-          persistent: true,
-        });
-      }
-      await refresh();
-    } catch (error) {
-      setCaptureError(error instanceof Error ? error.message : "global observation command failed");
-    }
-  }, [postCommand, refresh, snapshot.mode, snapshot.summary.capture_target]);
+      return closeModuleDependencies([...next]);
+    });
+  }, []);
 
   const resetCapture = useCallback(async () => {
     if (resetBusy) return;
@@ -945,12 +1074,7 @@ function App() {
     setCaptureError(null);
     try {
       let captureTarget = "global";
-      let numericLevel: number | undefined;
       if (action === "start") {
-        // The top-bar button can resume the active workspace session, but the
-        // capture console must always honor the target and level the user just
-        // selected. Previously any stopped session with existing events was
-        // treated as a resume, so the console silently ignored its level.
         const existingTarget = snapshot.mode === "live"
           && captureWorkspaceActive
           && snapshot.summary.event_count > 0
@@ -961,46 +1085,29 @@ function App() {
           pid: capturePidInput.trim(),
           name: captureNameInput.trim(),
         };
-        if (!existingTarget) {
-          numericLevel = Number(captureLevel.replace(/^L/i, ""));
-          if (!Number.isInteger(numericLevel) || numericLevel < 1 || numericLevel > 5) {
-            throw new Error("invalid observation level");
-          }
-        }
         if (selection.mode === "global") {
-          if (numericLevel !== undefined) {
-            await postCommand("/api/observations/default", { level: numericLevel });
-          }
         } else if (selection.mode === "pid") {
           const pid = Number(selection.pid);
           if (!Number.isInteger(pid) || pid <= 0) throw new Error("请输入有效 PID");
           captureTarget = `process:${pid}`;
-          if (numericLevel !== undefined) {
-            await postCommand("/api/observations", {
-              target: captureTarget,
-              level: numericLevel,
-              exact: true,
-              persistent: true,
-            });
-          }
         } else {
           const name = selection.name;
           if (!name) throw new Error("请输入进程名");
           captureTarget = `process-name:${name}`;
-          if (numericLevel !== undefined) {
-            await postCommand("/api/observations", {
-              target: captureTarget,
-              level: numericLevel,
-              exact: true,
-              persistent: true,
-            });
-          }
         }
+        if (captureModules.length === 0) throw new Error("至少选择一个采集模块");
+        const confirmPlaintext = !captureModules.includes("plaintext")
+          || window.confirm("Plaintext may contain credentials and private data. Start this capture?");
+        if (!confirmPlaintext) return;
+        await postCommand("/api/capture/start", {
+          target: captureTarget,
+          profile: captureProfile,
+          modules: captureModules,
+          confirm_plaintext: captureModules.includes("plaintext"),
+        });
+      } else {
+        await postCommand("/api/capture/stop");
       }
-      await postCommand(
-        `/api/capture/${action}`,
-        action === "start" ? { target: captureTarget, level: numericLevel } : undefined,
-      );
       setCaptureWorkspaceActive(action === "start");
       await refresh();
     } catch (error) {
@@ -1008,36 +1115,12 @@ function App() {
     } finally {
       setCaptureBusy(false);
     }
-  }, [captureLevel, captureNameInput, capturePidInput, captureTargetMode, captureWorkspaceActive, postCommand, refresh, snapshot.mode, snapshot.summary.capture_target, snapshot.summary.event_count]);
-
-  const setObservationLevel = useCallback(async (pid: number, level: string) => {
-    setObservationBusyPid(pid);
-    setObservationError(null);
-    try {
-      const numericLevel = Number(level.replace(/^L/i, ""));
-      if (!Number.isInteger(numericLevel) || numericLevel < 1 || numericLevel > 5) {
-        throw new Error("invalid observation level");
-      }
-      const response = await fetch(`${API_BASE}/api/observations`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target: `process:${pid}`, level: numericLevel, exact: true }),
-      });
-      if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || `observation command: ${response.status}`);
-      }
-      await refresh();
-    } catch (error) {
-      setObservationError(error instanceof Error ? error.message : "observation command failed");
-    } finally {
-      setObservationBusyPid(null);
-    }
-  }, [refresh]);
+  }, [captureModules, captureNameInput, capturePidInput, captureProfile, captureTargetMode, captureWorkspaceActive, postCommand, refresh, snapshot.mode, snapshot.summary.capture_target, snapshot.summary.event_count]);
 
   useEffect(() => {
+    if (IS_DESKTOP && desktopBoot.phase !== "ready") return;
     void refresh();
-  }, [refresh]);
+  }, [desktopBoot.phase, refresh]);
 
   useEffect(() => {
     if (snapshot.mode !== "live") return;
@@ -1052,10 +1135,11 @@ function App() {
   }, [captureWorkspaceActive, snapshot.mode, snapshot.summary.capture_state, snapshot.summary.capture_target]);
 
   useEffect(() => {
+    if (IS_DESKTOP && desktopBoot.phase !== "ready") return undefined;
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => void refresh(), 1000);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, refresh]);
+  }, [autoRefresh, desktopBoot.phase, refresh]);
 
   useEffect(() => {
     if (!selectedConnectionId && !selectedPayloadEntry) return undefined;
@@ -1086,7 +1170,6 @@ function App() {
           case "pid": return process.pid;
           case "connections": return process.connections;
           case "traffic": return process.sent_bytes + process.received_bytes;
-          case "level": return process.level;
         }
       };
       const result = compareSortableValues(valueFor(left), valueFor(right));
@@ -1185,6 +1268,10 @@ function App() {
     setConnectionSort((current) => nextSortState(current, column));
     setConnectionPageIndex(0);
   }, []);
+  const changeSessionSort = useCallback((column: Exclude<SessionColumnKey, "inspect">) => {
+    setSessionSort((current) => nextSortState(current, column));
+    setConnectionTimelineOffset(0);
+  }, []);
   const processTableWidth = Object.values(processColumnWidths).reduce((total, width) => total + width, 0);
   const connectionTableWidth = Object.values(connectionColumnWidths).reduce((total, width) => total + width, 0);
   const sessionGridTemplate = Object.values(sessionColumnWidths).map((width) => `${width}px`).join(" ");
@@ -1197,6 +1284,30 @@ function App() {
     && snapshot.summary.capture_state === "stopped";
   const statusText = isLive ? "Core connected" : "Core offline · demo data";
 
+  if (IS_DESKTOP && desktopBoot.phase !== "ready") {
+    return (
+      <main className="desktop-bootstrap">
+        <section className="desktop-bootstrap-card panel">
+          <div className="brand desktop-bootstrap-brand"><span className="brand-mark">◌</span><span>TraceLens</span></div>
+          <p className="eyebrow">LINUX DESKTOP</p>
+          <h1>{desktopBoot.phase === "error" ? "Core could not start" : "Starting TraceLens"}</h1>
+          <p className="hero-copy">
+            {desktopBoot.phase === "error"
+              ? desktopBoot.message
+              : "TraceLens needs administrator access to load eBPF programs. Approve the system authorization dialog to continue."}
+          </p>
+          {desktopBoot.phase === "starting" && <div className="desktop-spinner" aria-label="Starting Core" />}
+          {desktopBoot.phase === "error" && (
+            <button className="primary-button desktop-retry" onClick={() => void startDesktopCore()}>
+              Try again
+            </button>
+          )}
+          <small>Core starts idle. No traffic is captured until you press Start capture.</small>
+        </section>
+      </main>
+    );
+  }
+
   if (showCaptureConsole) {
     return (
       <main className="shell capture-shell">
@@ -1205,9 +1316,6 @@ function App() {
           <div className={`runtime-status ${isLive ? "" : "offline"}`}>
             <span className="status-dot" />
             {statusText}
-            <span className={`capture-state capture-state-${snapshot.summary.capture_state}`}>
-            {isCapturing ? "CAPTURING" : "READY"}
-            </span>
           </div>
         </header>
 
@@ -1219,12 +1327,8 @@ function App() {
               <p className="hero-copy">
                 {isCapturing
                   ? "TraceLens is armed. Generate traffic in the selected target, then inspect the captured session below."
-                  : "Nothing is being collected yet. Choose one target and an observation level, then press Start capture."}
+                  : "Nothing is being collected yet. Choose a target and the modules you need, then start a capture."}
               </p>
-            </div>
-            <div className={`capture-ready-mark ${isCapturing ? "active" : ""}`}>
-              <span className="status-dot" />
-              {isCapturing ? "LIVE" : "READY"}
             </div>
           </div>
 
@@ -1272,19 +1376,44 @@ function App() {
             {captureTargetMode === "global" && (
               <div className="capture-field capture-global-note">
                 <span>Global scope</span>
-                <p>对所有当前及之后出现的进程使用同一个观测等级。默认 L1，不采集明文。</p>
+                <p>追踪所有当前及之后出现的进程。只会启用下面选中的模块。</p>
               </div>
             )}
-            <label className="capture-field capture-level-field">
-              <span>Observation level</span>
-              <select value={captureLevel} onChange={(event) => setCaptureLevel(event.target.value)} disabled={isCapturing || captureBusy}>
-                <option value="L1">L1 · metadata</option>
-                <option value="L2">L2 · reserved</option>
-                <option value="L3">L3 · TLS metadata</option>
-                <option value="L4">L4 · HTTP text</option>
-                <option value="L5">L5 · plaintext</option>
-              </select>
-            </label>
+          </div>
+
+          <div className="capture-plan-builder">
+            <div className="capture-profile-picker">
+              <span className="capture-plan-label">Capture profile</span>
+              <div className="capture-profile-options">
+                {captureProfiles.map((profile) => (
+                  <button
+                    key={profile.id}
+                    type="button"
+                    className={`capture-profile-button ${captureProfile === profile.id ? "active" : ""}`}
+                    onClick={() => chooseCaptureProfile(profile.id)}
+                    disabled={isCapturing || captureBusy}
+                  >
+                    {profile.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="capture-module-grid">
+              {captureModuleOptions.map((module) => (
+                <label key={module.id} className={`capture-module-option ${module.id === "plaintext" ? "sensitive" : ""}`}>
+                  <input
+                    type="checkbox"
+                    checked={captureModules.includes(module.id)}
+                    onChange={(event) => toggleCaptureModule(module.id, event.target.checked)}
+                    disabled={isCapturing || captureBusy || (module.id === "process" && captureModules.length > 1)}
+                  />
+                  <span><strong>{module.label}</strong><small>{module.hint}</small></span>
+                </label>
+              ))}
+            </div>
+            <p className="capture-effective-plan">
+              Effective modules: {captureModules.length > 0 ? captureModules.join(" · ") : "none"}
+            </p>
           </div>
 
           <datalist id="process-pid-candidates">
@@ -1307,7 +1436,6 @@ function App() {
           <div className="process-picker">
             <div className="process-picker-heading">
               <div><p className="eyebrow">SYSTEM PROCESSES</p><h2>Quick select</h2></div>
-              <button className="ghost-button" onClick={() => void refresh()} disabled={refreshing}>Refresh list</button>
             </div>
             <div className="process-picker-list">
               {processCandidates.slice(0, 36).map((process) => (
@@ -1343,21 +1471,15 @@ function App() {
           </span>}
           {isLive && (
             <div className="capture-session-actions">
-              <label className="global-level-control">
-                <span>Global</span>
-                <select
-                  value={snapshot.summary.observation_level}
-                  onChange={(event) => void setGlobalObservationLevel(event.target.value)}
-                  disabled={captureBusy}
-                  aria-label="Global observation level"
+              <span className="capture-plan-summary">{snapshot.summary.capture_profile} · {snapshot.summary.capture_modules.join(" + ")}</span>
+              {tlsCapabilities.length > 0 && (
+                <span
+                  className={`tls-provider-summary ${tlsCapabilities.some((capability) => !capability.supported) ? "has-unsupported" : ""}`}
+                  title={tlsCapabilities.map((capability) => `${capability.provider}: ${capability.library}${capability.reason ? ` — ${capability.reason}` : ""}`).join("\n")}
                 >
-                  <option value="L1">L1</option>
-                  <option value="L2">L2</option>
-                  <option value="L3">L3</option>
-                  <option value="L4">L4</option>
-                  <option value="L5">L5</option>
-                </select>
-              </label>
+                  TLS {tlsCapabilities.map((capability) => `${capability.provider.split("_").join(" ")}${capability.supported ? "" : " unsupported"}`).join(" + ")}
+                </span>
+              )}
               {isCapturing && <button className="topbar-stop-button" onClick={() => void runCaptureCommand("stop")} disabled={captureBusy}>Stop</button>}
               {!isCapturing && <button className="topbar-capture-button" onClick={() => void runCaptureCommand("start")} disabled={captureBusy}>Start capture</button>}
               <button className="topbar-reset-button" onClick={() => void resetCapture()} disabled={resetBusy}>{resetBusy ? "Resetting…" : "Reset"}</button>
@@ -1407,7 +1529,6 @@ function App() {
               {refreshing ? "Syncing…" : "Refresh"}
             </button>
           </div>
-          {observationError && <p className="error-note">Observation change failed: {observationError}</p>}
           <div ref={processTableRef} className="table-wrap process-table-wrap">
             <table
               className="resizable-table"
@@ -1418,8 +1539,6 @@ function App() {
                 <col style={{ width: `${processColumnWidths.pid}px` }} />
                 <col style={{ width: `${processColumnWidths.connections}px` }} />
                 <col style={{ width: `${processColumnWidths.traffic}px` }} />
-                <col style={{ width: `${processColumnWidths.level}px` }} />
-                <col style={{ width: `${processColumnWidths.inspect}px` }} />
               </colgroup>
               <thead>
                 <tr>
@@ -1427,38 +1546,17 @@ function App() {
                   <SortableHeader label="PID" column="pid" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.pid} onResizeStart={(clientX) => beginProcessColumnResize("pid", clientX)} />
                   <SortableHeader label="Connections" column="connections" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.connections} onResizeStart={(clientX) => beginProcessColumnResize("connections", clientX)} />
                   <SortableHeader label="Traffic" column="traffic" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.traffic} onResizeStart={(clientX) => beginProcessColumnResize("traffic", clientX)} />
-                  <SortableHeader label="Level" column="level" sort={processSort} onSort={changeProcessSort} width={processColumnWidths.level} onResizeStart={(clientX) => beginProcessColumnResize("level", clientX)} />
-                  <th scope="col" style={{ width: `${processColumnWidths.inspect}px` }}>
-                    <span>Inspect</span>
-                    <ColumnResizer label="Inspect" onResizeStart={(clientX) => beginProcessColumnResize("inspect", clientX)} />
-                  </th>
                 </tr>
               </thead>
               <tbody>
                 {sortedProcesses.length === 0 ? (
-                  <tr><td colSpan={6} className="muted empty-cell">No processes observed yet.</td></tr>
+                  <tr><td colSpan={4} className="muted empty-cell">No processes observed yet.</td></tr>
                 ) : pagedProcesses.map((process) => (
                   <tr key={process.pid} data-scroll-key={`process:${process.pid}`}>
                     <td><span className="process-name">{process.name}</span></td>
                     <td className="muted">{process.pid}</td>
                     <td>{process.connections}</td>
                     <td>{formatBytes(process.sent_bytes + process.received_bytes)}</td>
-                    <td><span className={`level level-${process.level.toLowerCase()}`}>{process.level}</span></td>
-                    <td>
-                      <select
-                        className="observation-select"
-                        value={process.level}
-                        disabled={observationBusyPid === process.pid || !isLive}
-                        onChange={(event) => void setObservationLevel(process.pid, event.target.value)}
-                        aria-label={`Observation level for ${process.name} ${process.pid}`}
-                      >
-                        <option value="L1">L1 · metadata</option>
-                        <option value="L2">L2 · reserved</option>
-                        <option value="L3">L3 · TLS metadata</option>
-                        <option value="L4">L4 · HTTP + small text</option>
-                        <option value="L5">L5 · plaintext</option>
-                      </select>
-                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -1580,22 +1678,10 @@ function App() {
         </div>
         <div ref={sessionListRef} className="session-list">
           <div className="session-list-header" style={{ gridTemplateColumns: sessionGridTemplate }} role="row">
-            <div className="session-header-cell">
-              <span>Connection</span>
-              <ColumnResizer label="Connection" onResizeStart={(clientX) => beginSessionColumnResize("route", clientX)} />
-            </div>
-            <div className="session-header-cell">
-              <span>State</span>
-              <ColumnResizer label="State" onResizeStart={(clientX) => beginSessionColumnResize("state", clientX)} />
-            </div>
-            <div className="session-header-cell">
-              <span>Details</span>
-              <ColumnResizer label="Details" onResizeStart={(clientX) => beginSessionColumnResize("details", clientX)} />
-            </div>
-            <div className="session-header-cell">
-              <span>Session ID</span>
-              <ColumnResizer label="Session ID" onResizeStart={(clientX) => beginSessionColumnResize("id", clientX)} />
-            </div>
+            <SessionSortableHeader label="Connection" column="route" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("route", clientX)} />
+            <SessionSortableHeader label="State" column="state" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("state", clientX)} />
+            <SessionSortableHeader label="Details" column="details" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("details", clientX)} />
+            <SessionSortableHeader label="Session ID" column="id" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("id", clientX)} />
             <div className="session-header-cell">
               <span>Inspect</span>
               <ColumnResizer label="Inspect" onResizeStart={(clientX) => beginSessionColumnResize("inspect", clientX)} />
@@ -1744,6 +1830,7 @@ function App() {
                     <div>
                       <div className="timeline-meta">
                         <span className="timeline-kind">{timelineKindLabel(event.kind)}</span>
+                        {tlsProvenance(event) && <span className="provider-hint" title={event.tls_library ?? undefined}>{tlsProvenance(event)}</span>}
                         {canInspectPayload(event) && <span className="payload-hint">click to inspect</span>}
                       </div>
                       <strong>{event.summary}</strong>
@@ -1794,6 +1881,7 @@ function App() {
             <div className="modal-meta">
               <span>{selectedPayloadEntry.http_direction ? `HTTP ${stateLabel(selectedPayloadEntry.http_direction)}` : stateLabel(selectedPayloadEntry.plaintext_direction ?? "plaintext")}</span>
               {selectedPayloadEntry.http_host && <span>Host {selectedPayloadEntry.http_host}</span>}
+              {tlsProvenance(selectedPayloadEntry) && <span title={selectedPayloadEntry.tls_library ?? undefined}>{tlsProvenance(selectedPayloadEntry)}</span>}
               {selectedPayloadEntry.http_headers?.length ? <span>{selectedPayloadEntry.http_headers.length} headers</span> : null}
               {payloadBytes(selectedPayloadEntry) !== null && <span>{formatBytes(payloadBytes(selectedPayloadEntry) ?? 0)} captured</span>}
               {selectedPayloadEntry.http_body_truncated || selectedPayloadEntry.plaintext_truncated ? <span className="payload-warning">preview truncated</span> : null}
@@ -1847,8 +1935,8 @@ function App() {
                 <option value="tcp_bytes">TCP bytes</option>
                 <option value="tcp_close">TCP close</option>
                 <option value="tls_metadata">TLS metadata</option>
-                <option value="plaintext">Plaintext (L5)</option>
-                <option value="http">HTTP (L4)</option>
+                <option value="plaintext">Plaintext</option>
+                <option value="http">HTTP</option>
                 <option value="file_open">File open</option>
                 <option value="file_read">File read</option>
               </select>
@@ -1921,6 +2009,7 @@ function App() {
               <div className="timeline-content">
                 <div className="timeline-meta">
                   <span className="timeline-kind">{timelineKindLabel(entry.kind)}</span>
+                  {tlsProvenance(entry) && <span className="provider-hint" title={entry.tls_library ?? undefined}>{tlsProvenance(entry)}</span>}
                   {entry.process_name && <span className="muted">{entry.process_name}</span>}
                   {entry.pid !== null && <span className="muted">PID {entry.pid}</span>}
                   {canInspectPayload(entry) && <span className="payload-hint">click to inspect</span>}

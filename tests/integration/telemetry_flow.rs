@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use tracelens_core::{
     api::server,
+    capture::CaptureProfile,
     config::{CoreConfig, StorageMode},
-    events::{ConnectionTimelineFilter, TimelineFilter},
+    events::{ConnectionTimelineFilter, ConnectionTimelineSort, TimelineFilter},
     observation::{ObservationLevel, ObservationTarget},
     CaptureScope, CaptureState, Core,
 };
@@ -67,6 +68,60 @@ fn ingest_connection(
         connection,
         timestamp_ns,
     ));
+}
+
+#[test]
+fn sorts_connection_sessions_before_pagination() {
+    let mut core = Core::new(CoreConfig::default());
+    core.ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+
+    let mut low_traffic = connection(
+        "session-a",
+        None,
+        ConnectionState::Established,
+        TcpState::Established,
+        10,
+        20,
+    );
+    low_traffic.remote.address = "192.0.2.10".to_owned();
+    let mut high_traffic = connection(
+        "session-b",
+        None,
+        ConnectionState::Established,
+        TcpState::Established,
+        4_000,
+        8_000,
+    );
+    high_traffic.remote.address = "192.0.2.20".to_owned();
+    ingest_connection(
+        &mut core,
+        EventKind::TcpConnect,
+        high_traffic,
+        BASE_TIME_NS + 1,
+    );
+    ingest_connection(
+        &mut core,
+        EventKind::TcpConnect,
+        low_traffic,
+        BASE_TIME_NS + 2,
+    );
+
+    let smallest = core.connection_timeline_page(ConnectionTimelineFilter {
+        sort_by: ConnectionTimelineSort::Details,
+        sort_descending: false,
+        limit: 1,
+        ..ConnectionTimelineFilter::default()
+    });
+    assert_eq!(smallest.total, 2);
+    assert_eq!(smallest.sessions[0].id, "session-a");
+
+    let highest_id = core.connection_timeline_page(ConnectionTimelineFilter {
+        sort_by: ConnectionTimelineSort::Id,
+        sort_descending: true,
+        limit: 1,
+        ..ConnectionTimelineFilter::default()
+    });
+    assert_eq!(highest_id.sessions[0].id, "session-b");
 }
 
 #[test]
@@ -340,19 +395,26 @@ fn parses_http_messages_from_reassembled_plaintext() {
         },
         BASE_TIME_NS + 2,
     ));
-    core.ingest_event(TraceEvent::http_capture(
-        EventSource::Kernel,
-        PID,
-        PlaintextEventData {
-            ssl_object: 0x5678,
-            fd: Some(fd as i32),
-            direction: PlaintextDirection::Write,
-            data: "User-Agent: tracelens\r\n\r\n".to_owned(),
-            bytes: 26,
-            truncated: false,
-        },
-        BASE_TIME_NS + 3,
-    ));
+    core.ingest_event(
+        TraceEvent::http_capture(
+            EventSource::Kernel,
+            PID,
+            PlaintextEventData {
+                ssl_object: 0x5678,
+                fd: Some(fd as i32),
+                direction: PlaintextDirection::Write,
+                data: "User-Agent: tracelens\r\n\r\n".to_owned(),
+                bytes: 26,
+                truncated: false,
+            },
+            BASE_TIME_NS + 3,
+        )
+        .with_instrumentation(
+            "GnuTLS",
+            "/lib/libgnutls.so",
+            tracelens_events::TLS_API_GNUTLS_SEND,
+        ),
+    );
     core.ingest_event(TraceEvent::http_capture(
         EventSource::Kernel,
         PID,
@@ -388,6 +450,11 @@ fn parses_http_messages_from_reassembled_plaintext() {
     assert_eq!(page.entries[0].summary, "HTTP request GET /health");
     assert_eq!(page.entries[0].http_host.as_deref(), Some("example.net"));
     assert_eq!(page.entries[0].http_headers.len(), 2);
+    assert_eq!(page.entries[0].tls_provider.as_deref(), Some("GnuTLS"));
+    assert_eq!(
+        page.entries[0].tls_api_function.as_deref(),
+        Some("gnutls_record_send")
+    );
     assert_eq!(page.entries[1].summary, "HTTP response 200 OK");
     assert_eq!(page.entries[1].http_status, Some(200));
     assert_eq!(page.entries[1].http_content_length, Some(2));
@@ -829,6 +896,30 @@ fn capture_is_idle_until_started_and_reset_discards_the_session() {
 }
 
 #[test]
+fn capture_modules_filter_events_before_they_enter_the_session() {
+    let mut core = Core::new(CoreConfig::default());
+    core.enable_observer_capture_mode();
+    core.stop_capture();
+    core.configure_capture(CaptureProfile::Process, None)
+        .expect("process capture plan");
+    core.start_capture();
+
+    core.ingest_event(process_event(EventKind::ProcessExec, u64::MAX - 2));
+    core.ingest_event(TraceEvent::dns_event(
+        EventSource::Kernel,
+        EventKind::DnsResponse,
+        PID,
+        "example.net",
+        vec![FAKE_IP.to_owned()],
+        60,
+        u64::MAX - 1,
+    ));
+
+    assert_eq!(core.store().len(), 1);
+    assert_eq!(core.store().snapshot()[0].kind, EventKind::ProcessExec);
+}
+
+#[test]
 fn capture_scope_limits_kernel_events_to_a_pid_or_process_name() {
     let mut pid_core = Core::new(CoreConfig::default());
     pid_core.stop_capture();
@@ -908,7 +999,11 @@ fn switching_capture_scope_drops_the_previous_exact_level() {
 #[test]
 fn serves_capture_start_and_reset_commands_through_the_api() {
     let core = Arc::new(Mutex::new(Core::new(CoreConfig::default())));
-    core.lock().expect("core lock").stop_capture();
+    {
+        let mut core = core.lock().expect("core lock");
+        core.enable_observer_capture_mode();
+        core.stop_capture();
+    }
 
     let request = |method: &str, path: &str, body: &str| {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture API listener");
@@ -938,12 +1033,31 @@ fn serves_capture_start_and_reset_commands_through_the_api() {
         serde_json::from_str::<serde_json::Value>(body).expect("capture API JSON")
     };
 
+    let capabilities = request("GET", "/api/capabilities", "");
+    assert!(capabilities["profiles"]
+        .as_array()
+        .expect("profiles")
+        .contains(&serde_json::Value::String("web".to_owned())));
+    assert_eq!(capabilities["plaintext_requires_confirmation"], true);
+    assert!(request("GET", "/api/tls-capabilities", "")
+        .as_array()
+        .expect("TLS capabilities")
+        .is_empty());
+
     let started = request(
         "POST",
         "/api/capture/start",
-        r#"{"target":"process-name:curl","level":4}"#,
+        r#"{"target":"process-name:curl","profile":"web","modules":["process","connections","traffic","dns","tls","http"]}"#,
     );
     assert_eq!(started["state"], "capturing");
+    assert_eq!(started["profile"], "web");
+    assert_eq!(started["effective_modules"][4], "tls");
+    assert_eq!(started["effective_modules"][5], "http");
+    assert!(started["effective_modules"]
+        .as_array()
+        .expect("effective module array")
+        .iter()
+        .all(|module| module != "plaintext"));
     assert_eq!(
         core.lock().expect("core lock").capture_scope(),
         &CaptureScope::ProcessName("curl".to_owned())
@@ -951,13 +1065,48 @@ fn serves_capture_start_and_reset_commands_through_the_api() {
 
     core.lock()
         .expect("core lock")
-        .ingest_event(process_event(EventKind::ProcessExec, BASE_TIME_NS));
+        .ingest_event(process_event(EventKind::ProcessExec, u64::MAX - 1));
     assert_eq!(core.lock().expect("core lock").store().len(), 1);
 
     let reset = request("POST", "/api/capture/reset", "");
     assert_eq!(reset["state"], "capturing");
     assert_eq!(reset["event_count"], 0);
     assert!(core.lock().expect("core lock").store().is_empty());
+
+    let stopped = request("POST", "/api/capture/stop", "");
+    assert_eq!(stopped["state"], "stopped");
+    let legacy = request(
+        "POST",
+        "/api/capture/start",
+        r#"{"target":"global","level":4}"#,
+    );
+    assert_eq!(legacy["profile"], "custom");
+    assert!(legacy["warnings"][0]
+        .as_str()
+        .expect("legacy warning")
+        .contains("deprecated"));
+
+    request("POST", "/api/capture/stop", "");
+    let legacy_plaintext = request(
+        "POST",
+        "/api/capture/start",
+        r#"{"target":"global","level":5}"#,
+    );
+    assert!(legacy_plaintext["effective_modules"]
+        .as_array()
+        .expect("legacy plaintext modules")
+        .contains(&serde_json::Value::String("plaintext".to_owned())));
+
+    request("POST", "/api/capture/stop", "");
+    let rejected = request(
+        "POST",
+        "/api/capture/start",
+        r#"{"target":"global","profile":"custom","modules":["plaintext"]}"#,
+    );
+    assert_eq!(
+        rejected["error"],
+        "plaintext module requires confirm_plaintext=true"
+    );
 }
 
 #[test]

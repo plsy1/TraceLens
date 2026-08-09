@@ -1,4 +1,5 @@
 #include "common.h"
+#include "capture_filter.h"
 
 struct trace_event_raw_sys_enter {
     __u64 _unused;
@@ -19,6 +20,10 @@ int tracelens_file_open(struct trace_event_raw_sys_enter *ctx)
 {
     struct tracelens_file_event *event;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    if (!capture_matches_current()) {
+        return 0;
+    }
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event) {

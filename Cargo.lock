@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "tracelens-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "libbpf-rs",
  "libc",
@@ -277,14 +277,14 @@ dependencies = [
 
 [[package]]
 name = "tracelens-events"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "tracelens-integration-tests"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde_json",
  "tracelens-core",

@@ -8,10 +8,12 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 use tracelens_events::{ConnectionState, EventKind, TcpState, TransportProtocol};
 
+use crate::capture::{CaptureFeatures, CaptureModule, CaptureProfile, ProbePlan};
 use crate::detection::{Alert, AlertSeverity};
-use crate::events::{ConnectionTimelineFilter, TimelineFilter};
+use crate::events::{ConnectionTimelineFilter, ConnectionTimelineSort, TimelineFilter};
 use crate::graph::BehaviorGraph;
 use crate::observation::{ObservationLevel, ObservationTarget};
+use crate::runtime::provider::TlsCapability;
 use crate::{CaptureScope, Core};
 
 #[derive(Debug, Serialize)]
@@ -22,6 +24,16 @@ struct HealthResponse {
     detail: String,
     attached_probes: Vec<String>,
     probe_errors: Vec<String>,
+    userspace_provider_instances: usize,
+    userspace_reader_count: usize,
+    userspace_link_count: usize,
+    tls_capabilities: Vec<TlsCapability>,
+    kernel_runtime_state: String,
+    kernel_objects: Vec<String>,
+    kernel_programs: Vec<String>,
+    kernel_link_count: usize,
+    kernel_capture_target: Option<String>,
+    kernel_runtime_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -30,7 +42,8 @@ struct SummaryResponse {
     connections: usize,
     domains: usize,
     alerts: usize,
-    observation_level: String,
+    capture_profile: CaptureProfile,
+    capture_modules: Vec<CaptureModule>,
     capture_state: String,
     capture_target: String,
     event_count: usize,
@@ -40,6 +53,12 @@ struct SummaryResponse {
 struct CaptureResponse {
     state: String,
     event_count: usize,
+    target: String,
+    profile: CaptureProfile,
+    requested_modules: Vec<CaptureModule>,
+    effective_modules: Vec<CaptureModule>,
+    probe_plan: ProbePlan,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,7 +79,6 @@ struct ProcessResponse {
     connections: usize,
     sent_bytes: u64,
     received_bytes: u64,
-    level: String,
     risk_score: f32,
 }
 
@@ -116,7 +134,19 @@ struct DefaultObservationResponse {
 #[derive(Debug, Deserialize, Default)]
 struct CaptureStartCommand {
     target: Option<String>,
+    profile: Option<CaptureProfile>,
+    modules: Option<Vec<CaptureModule>>,
+    #[serde(default)]
+    confirm_plaintext: bool,
+    /// Deprecated compatibility input. New clients must send modules.
     level: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct CapabilitiesResponse {
+    profiles: Vec<CaptureProfile>,
+    modules: Vec<CaptureModule>,
+    plaintext_requires_confirmation: bool,
 }
 
 pub fn serve(core: Arc<Mutex<Core>>, listen: SocketAddr) -> std::io::Result<()> {
@@ -188,6 +218,8 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
     let body = match path {
         "/api/health" => response_json(|| {
             let core = core.lock().map_err(|_| "core lock poisoned")?;
+            let kernel = core.kernel_runtime_status().unwrap_or_default();
+            let userspace = core.userspace_probe_diagnostics();
             Ok(HealthResponse {
                 status: "ok",
                 kernel_observation: core.runtime_status().kernel_observation,
@@ -208,6 +240,16 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                     })
                     .collect(),
                 probe_errors: core.probe_errors().to_vec(),
+                userspace_provider_instances: userspace.provider_instances,
+                userspace_reader_count: userspace.readers,
+                userspace_link_count: userspace.links,
+                tls_capabilities: core.tls_capabilities().to_vec(),
+                kernel_runtime_state: kernel.state.to_string(),
+                kernel_objects: kernel.objects,
+                kernel_programs: kernel.programs,
+                kernel_link_count: kernel.link_count,
+                kernel_capture_target: kernel.capture_target,
+                kernel_runtime_error: kernel.error,
             })
         }),
         "/api/summary" => response_json(|| {
@@ -228,18 +270,34 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                 connections: active_connections,
                 domains,
                 alerts: core.alerts().len(),
-                observation_level: core.config().default_observation_level.to_string(),
+                capture_profile: core.capture_plan().profile,
+                capture_modules: core.capture_plan().effective.modules(),
                 capture_state: core.capture_state().to_string(),
                 capture_target: core.capture_scope().to_string(),
                 event_count: core.store().len(),
             })
         }),
-        "/api/capture" => response_json(|| {
+        "/api/capture" | "/api/capture/plan" => response_json(|| {
             let core = core.lock().map_err(|_| "core lock poisoned")?;
-            Ok(CaptureResponse {
-                state: core.capture_state().to_string(),
-                event_count: core.store().len(),
+            Ok(capture_response(&core, Vec::new()))
+        }),
+        "/api/capabilities" => response_json(|| {
+            Ok(CapabilitiesResponse {
+                profiles: vec![
+                    CaptureProfile::Process,
+                    CaptureProfile::Connections,
+                    CaptureProfile::Network,
+                    CaptureProfile::Web,
+                    CaptureProfile::Security,
+                    CaptureProfile::Custom,
+                ],
+                modules: CaptureModule::ALL.to_vec(),
+                plaintext_requires_confirmation: true,
             })
+        }),
+        "/api/tls-capabilities" => response_json(|| {
+            let core = core.lock().map_err(|_| "core lock poisoned")?;
+            Ok(core.tls_capabilities().to_vec())
         }),
         "/api/process-candidates" => response_json(|| {
             let core = core.lock().map_err(|_| "core lock poisoned")?;
@@ -288,7 +346,6 @@ fn handle_connection(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> std::io:
                         connections,
                         sent_bytes,
                         received_bytes,
-                        level: core.observation_level_for_process(pid).to_string(),
                         risk_score: core.risk_score_for_process(pid).0,
                     }
                 })
@@ -400,6 +457,7 @@ fn handle_capture_command(
             Ok(core) => core,
             Err(_) => return write_json_error(stream, 500, "core lock poisoned"),
         };
+        let mut compatibility_warnings = Vec::new();
         if action == "start" && !body.trim().is_empty() {
             let command: CaptureStartCommand = match serde_json::from_str(body) {
                 Ok(command) => command,
@@ -411,6 +469,8 @@ fn handle_capture_command(
                     )
                 }
             };
+            let modules_supplied = command.modules.is_some();
+            let legacy_plaintext_confirmation = !modules_supplied && command.level == Some(5);
             if let Some(raw_target) = command.target {
                 let scope = if raw_target == "global" {
                     CaptureScope::Global
@@ -428,47 +488,76 @@ fn handle_capture_command(
                 };
                 core.set_capture_scope(scope);
             }
-            if let Some(raw_level) = command.level {
-                let Some(level) = ObservationLevel::from_number(raw_level) else {
+            let requested = if let Some(modules) = command.modules {
+                if command.level.is_some() {
+                    compatibility_warnings
+                        .push("level ignored because modules were supplied".to_owned());
+                }
+                Some(CaptureFeatures::from_modules(modules))
+            } else if let Some(raw_level) = command.level {
+                let Some(features) = CaptureFeatures::legacy_level(raw_level) else {
                     return write_json_error(
                         stream,
                         400,
                         "observation level must be between 1 and 5",
                     );
                 };
-                match core.capture_scope().clone() {
-                    CaptureScope::Global => {
-                        core.set_default_observation_level(level);
-                    }
-                    CaptureScope::Process(pid) => {
-                        core.set_persistent_observation(ObservationTarget::Process(pid), level);
-                    }
-                    CaptureScope::ProcessName(name) => {
-                        core.set_persistent_observation(
-                            ObservationTarget::ProcessName(name),
-                            level,
-                        );
-                    }
+                compatibility_warnings
+                    .push("level is deprecated; translated to capture modules".to_owned());
+                Some(features)
+            } else {
+                None
+            };
+            let profile = command.profile.unwrap_or_else(|| {
+                if requested.is_some() {
+                    CaptureProfile::Custom
+                } else {
+                    CaptureProfile::Network
                 }
+            });
+            if requested.is_some_and(|features| features.contains(CaptureModule::Plaintext))
+                && !command.confirm_plaintext
+                && !legacy_plaintext_confirmation
+            {
+                return write_json_error(
+                    stream,
+                    400,
+                    "plaintext module requires confirm_plaintext=true",
+                );
+            }
+            if let Err(error) = core.configure_capture(profile, requested) {
+                return write_json_error(stream, 400, &error);
             }
         }
         let state = match action {
-            "start" => Ok(core.start_capture()),
-            "stop" => Ok(core.stop_capture()),
+            "start" => core.try_start_capture(),
+            "stop" => core.try_stop_capture(),
             "reset" => core.reset_capture(),
             _ => return write_json_error(stream, 404, "unknown capture command"),
         };
         match state {
-            Ok(state) => CaptureResponse {
-                state: state.to_string(),
-                event_count: core.store().len(),
-            },
+            Ok(_state) => capture_response(&core, compatibility_warnings),
             Err(error) => return write_json_error(stream, 500, &error),
         }
     };
     let body = serde_json::to_string(&response)
         .map_err(|error| io::Error::other(format!("encode capture response: {error}")))?;
     write_response(stream, 200, &body, "application/json")
+}
+
+fn capture_response(core: &Core, mut warnings: Vec<String>) -> CaptureResponse {
+    let plan = core.capture_plan();
+    warnings.extend(plan.warnings.iter().cloned());
+    CaptureResponse {
+        state: core.capture_state().to_string(),
+        event_count: core.store().len(),
+        target: core.capture_scope().to_string(),
+        profile: plan.profile,
+        requested_modules: plan.requested.modules(),
+        effective_modules: plan.effective.modules(),
+        probe_plan: plan.probes.clone(),
+        warnings,
+    }
 }
 
 fn handle_default_observation_command(
@@ -519,6 +608,13 @@ fn timeline_filter(query: &str) -> TimelineFilter {
 }
 
 fn connection_timeline_filter(query: &str) -> ConnectionTimelineFilter {
+    let sort_by = match query_parameter(query, "sort").as_deref() {
+        Some("route") => ConnectionTimelineSort::Route,
+        Some("state") => ConnectionTimelineSort::State,
+        Some("details") => ConnectionTimelineSort::Details,
+        Some("id") => ConnectionTimelineSort::Id,
+        _ => ConnectionTimelineSort::LastSeen,
+    };
     ConnectionTimelineFilter {
         pid: query_parameter(query, "pid").and_then(|value| value.parse().ok()),
         connection_id: query_parameter(query, "connection_id"),
@@ -535,6 +631,8 @@ fn connection_timeline_filter(query: &str) -> ConnectionTimelineFilter {
             .and_then(|value| value.parse().ok())
             .unwrap_or(200)
             .clamp(1, 200),
+        sort_by,
+        sort_descending: query_parameter(query, "direction").as_deref() != Some("asc"),
         offset: query_parameter(query, "offset")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),

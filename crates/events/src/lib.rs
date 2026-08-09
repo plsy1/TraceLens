@@ -12,6 +12,66 @@ pub enum EventSource {
     Core,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstrumentationSource {
+    pub provider: String,
+    pub library: String,
+    pub api_function: String,
+}
+
+pub const TLS_API_OPENSSL_CONNECT: u16 = 1;
+pub const TLS_API_OPENSSL_GET_SERVERNAME: u16 = 2;
+pub const TLS_API_OPENSSL_GET_VERSION: u16 = 3;
+pub const TLS_API_OPENSSL_GET_FD: u16 = 4;
+pub const TLS_API_OPENSSL_SET_FD: u16 = 5;
+pub const TLS_API_OPENSSL_READ: u16 = 6;
+pub const TLS_API_OPENSSL_WRITE: u16 = 7;
+pub const TLS_API_OPENSSL_READ_EX: u16 = 8;
+pub const TLS_API_OPENSSL_WRITE_EX: u16 = 9;
+pub const TLS_API_GNUTLS_HANDSHAKE: u16 = 20;
+pub const TLS_API_GNUTLS_SET_FD: u16 = 21;
+pub const TLS_API_GNUTLS_RECV: u16 = 22;
+pub const TLS_API_GNUTLS_SEND: u16 = 23;
+pub const TLS_API_GNUTLS_SERVER_NAME: u16 = 24;
+pub const TLS_API_GNUTLS_PROTOCOL: u16 = 25;
+pub const TLS_API_NSS_IMPORT_FD: u16 = 40;
+pub const TLS_API_NSPR_READ: u16 = 41;
+pub const TLS_API_NSPR_WRITE: u16 = 42;
+pub const TLS_API_NSS_SET_URL: u16 = 43;
+pub const TLS_API_NSS_CHANNEL_INFO: u16 = 44;
+pub const TLS_API_RUSTLS_READ: u16 = 60;
+pub const TLS_API_RUSTLS_WRITE: u16 = 61;
+pub const TLS_API_RUSTLS_PROCESS_PACKETS: u16 = 62;
+
+pub fn tls_api_function(api_id: u16) -> Option<&'static str> {
+    match api_id {
+        TLS_API_OPENSSL_CONNECT => Some("SSL_connect"),
+        TLS_API_OPENSSL_GET_SERVERNAME => Some("SSL_get_servername"),
+        TLS_API_OPENSSL_GET_VERSION => Some("SSL_get_version"),
+        TLS_API_OPENSSL_GET_FD => Some("SSL_get_fd"),
+        TLS_API_OPENSSL_SET_FD => Some("SSL_set_fd"),
+        TLS_API_OPENSSL_READ => Some("SSL_read"),
+        TLS_API_OPENSSL_WRITE => Some("SSL_write"),
+        TLS_API_OPENSSL_READ_EX => Some("SSL_read_ex"),
+        TLS_API_OPENSSL_WRITE_EX => Some("SSL_write_ex"),
+        TLS_API_GNUTLS_HANDSHAKE => Some("gnutls_handshake"),
+        TLS_API_GNUTLS_SET_FD => Some("gnutls_transport_set_int2"),
+        TLS_API_GNUTLS_RECV => Some("gnutls_record_recv"),
+        TLS_API_GNUTLS_SEND => Some("gnutls_record_send"),
+        TLS_API_GNUTLS_SERVER_NAME => Some("gnutls_server_name_set"),
+        TLS_API_GNUTLS_PROTOCOL => Some("gnutls_protocol_get_version"),
+        TLS_API_NSS_IMPORT_FD => Some("SSL_ImportFD"),
+        TLS_API_NSPR_READ => Some("PR_Read"),
+        TLS_API_NSPR_WRITE => Some("PR_Write"),
+        TLS_API_NSS_SET_URL => Some("SSL_SetURL"),
+        TLS_API_NSS_CHANNEL_INFO => Some("SSL_GetChannelInfo"),
+        TLS_API_RUSTLS_READ => Some("rustls_connection_read"),
+        TLS_API_RUSTLS_WRITE => Some("rustls_connection_write"),
+        TLS_API_RUSTLS_PROCESS_PACKETS => Some("rustls_connection_process_new_packets"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -252,7 +312,27 @@ pub struct TraceEvent {
     pub pid: Option<u32>,
     pub process: Option<ProcessRef>,
     pub connection: Option<ConnectionRef>,
+    #[serde(default)]
+    pub instrumentation: Option<InstrumentationSource>,
     pub payload: EventPayload,
+}
+
+impl TraceEvent {
+    pub fn with_instrumentation(
+        mut self,
+        provider: impl Into<String>,
+        library: impl Into<String>,
+        api_id: u16,
+    ) -> Self {
+        if let Some(api_function) = tls_api_function(api_id) {
+            self.instrumentation = Some(InstrumentationSource {
+                provider: provider.into(),
+                library: library.into(),
+                api_function: api_function.to_owned(),
+            });
+        }
+        self
+    }
 }
 
 impl TraceEvent {
@@ -291,6 +371,7 @@ impl TraceEvent {
                 start_time_ns: Some(timestamp_ns),
             }),
             connection: None,
+            instrumentation: None,
             payload: EventPayload::Process {
                 executable: executable.to_owned(),
                 command_line: command_line.to_owned(),
@@ -324,6 +405,7 @@ impl TraceEvent {
             pid: Some(pid),
             process,
             connection: Some(connection.clone()),
+            instrumentation: None,
             payload: EventPayload::Connection { connection },
         }
     }
@@ -366,6 +448,7 @@ impl TraceEvent {
             pid: Some(pid),
             process: None,
             connection: None,
+            instrumentation: None,
             payload: EventPayload::Dns {
                 protocol: data.protocol,
                 domain: data.domain,
@@ -384,6 +467,7 @@ impl TraceEvent {
             pid: None,
             process: None,
             connection: None,
+            instrumentation: None,
             payload: EventPayload::Observation { target, level },
         }
     }
@@ -402,6 +486,7 @@ impl TraceEvent {
             pid: Some(pid),
             process: None,
             connection: None,
+            instrumentation: None,
             payload: EventPayload::Tls {
                 ssl_object: data.ssl_object,
                 fd: data.fd,
@@ -429,6 +514,7 @@ impl TraceEvent {
             pid: Some(pid),
             process: None,
             connection: None,
+            instrumentation: None,
             payload: EventPayload::Plaintext {
                 ssl_object: data.ssl_object,
                 fd: data.fd,
@@ -467,6 +553,7 @@ impl TraceEvent {
             pid: Some(pid),
             process: None,
             connection: None,
+            instrumentation: None,
             payload: EventPayload::Http {
                 direction: data.direction,
                 version: data.version,
@@ -504,6 +591,7 @@ impl TraceEvent {
             pid: Some(pid),
             process: None,
             connection: None,
+            instrumentation: None,
             payload: EventPayload::HttpCapture {
                 ssl_object: data.ssl_object,
                 fd: data.fd,
@@ -532,6 +620,7 @@ impl TraceEvent {
             pid: Some(pid),
             process: None,
             connection: None,
+            instrumentation: None,
             payload: EventPayload::File {
                 path: data.path,
                 bytes: data.bytes,

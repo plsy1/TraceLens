@@ -41,6 +41,7 @@ pub struct CliOptions {
     pub config: CoreConfig,
     pub api_listen: std::net::SocketAddr,
     pub observe: bool,
+    pub desktop_child: bool,
     pub print_example_event: bool,
     pub help: bool,
 }
@@ -55,6 +56,7 @@ impl CliOptions {
             .parse()
             .expect("the default API address must be valid");
         let mut observe = false;
+        let mut desktop_child = false;
         let mut print_example_event = false;
         let mut help = false;
         let mut args = args.into_iter();
@@ -118,25 +120,8 @@ impl CliOptions {
                         eprintln!("warning: --memory-event-limit requires a positive integer");
                     }
                 }
-                "--default-observation-level" => {
-                    if let Some(value) = args.next() {
-                        match value
-                            .parse::<u8>()
-                            .ok()
-                            .and_then(ObservationLevel::from_number)
-                        {
-                            Some(level) => config.default_observation_level = level,
-                            None => eprintln!(
-                                "warning: --default-observation-level requires a value from 1 to 5"
-                            ),
-                        }
-                    } else {
-                        eprintln!(
-                            "warning: --default-observation-level requires a value from 1 to 5"
-                        );
-                    }
-                }
                 "--observe" => observe = true,
+                "--desktop-child" => desktop_child = true,
                 "--print-example-event" => print_example_event = true,
                 "-h" | "--help" => help = true,
                 unknown => eprintln!("warning: ignoring unknown option: {unknown}"),
@@ -147,8 +132,27 @@ impl CliOptions {
             config,
             api_listen,
             observe,
+            desktop_child,
             print_example_event,
             help,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliOptions;
+
+    #[test]
+    fn parses_desktop_child_lifetime_mode() {
+        let options = CliOptions::from_args([
+            "--observe".to_owned(),
+            "--desktop-child".to_owned(),
+            "--api-listen".to_owned(),
+            "127.0.0.1:18080".to_owned(),
+        ]);
+        assert!(options.observe);
+        assert!(options.desktop_child);
+        assert_eq!(options.api_listen.to_string(), "127.0.0.1:18080");
     }
 }

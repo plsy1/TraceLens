@@ -16,15 +16,26 @@ page metadata (`total`, `offset`, and `has_more`). Storage coverage verifies
 that the default memory-only mode does not create a database file; the opt-in
 durable mode reopens SQLite and verifies that timeline and process state return.
 
-Observation coverage exercises the command API and target-level L1-L5 state.
+Capture coverage exercises Profile expansion, module dependencies, lifecycle
+commands, Plaintext confirmation, and legacy Level compatibility translation.
 
 Connection timeline coverage verifies canonical connection IDs, DNS context
 inside a session, grouped TCP events, lazy event payloads, capped session
 details, and the `/api/connection-timeline` API.
 
 HTTP coverage verifies bounded HTTP/1.1 request/response parsing, partial
-header reassembly, Content-Length framing, L4 raw-capture dropping, and HTTP
+header reassembly, Content-Length framing, HTTP raw-capture dropping, and HTTP
 metadata projection into the connection Timeline.
 
-The future privileged acceptance test will launch `curl` against the real
-observer and verify the kernel probe/API path end to end.
+Privileged runtime coverage is separate from normal CI:
+
+```bash
+./scripts/privileged-e2e.sh
+./scripts/tls-provider-e2e.sh
+```
+
+It launches `curl` against a real observer and verifies the Profile link
+matrix, Provider object/reader ownership, scoped HTTPS-to-HTTP capture, and
+complete Kernel/Userspace detach. `fixtures/nss_http_client.c` exercises the
+NSS/NSPR object allowlist against a local TLS response, and
+`fixtures/dlopen_tls.c` verifies delayed-library reconciliation.
