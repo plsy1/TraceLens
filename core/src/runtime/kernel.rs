@@ -3,15 +3,19 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File};
+use std::io;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
 use std::{net::IpAddr, net::Ipv4Addr, net::Ipv6Addr};
 
-use libbpf_rs::{Link, MapCore, MapFlags, Object, ObjectBuilder, RingBufferBuilder};
+use libbpf_rs::{
+    set_print, ErrorKind, Link, MapCore, MapFlags, Object, ObjectBuilder, PrintLevel,
+    RingBufferBuilder,
+};
 use tracelens_events::{
     ConnectionRef, ConnectionState, DnsEventData, Endpoint, EventKind, EventSource, FileEventData,
     ProcessRef, TcpState, TraceEvent, TransportProtocol,
@@ -42,6 +46,17 @@ const FILE_PATH_LEN: usize = 256;
 const SCOPE_GLOBAL: u32 = 0;
 const SCOPE_PID: u32 = 1;
 const SCOPE_COMM: u32 = 2;
+const LIBBPF_LOG_LIMIT: usize = 256 * 1024;
+
+static LIBBPF_LOG_INIT: Once = Once::new();
+static LIBBPF_LOAD_LOCK: Mutex<()> = Mutex::new(());
+static LIBBPF_LOG: Mutex<String> = Mutex::new(String::new());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemlockLimits {
+    soft: libc::rlim_t,
+    hard: libc::rlim_t,
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +336,8 @@ fn run_kernel_plan(
     let dns_enabled = features.contains(CaptureModule::Dns);
     let files_enabled = features.contains(CaptureModule::Files);
 
+    raise_memlock_limit()?;
+
     let mut process_object = load_optional_object(config, "process.o", process_enabled)?;
     let mut network_object = load_optional_object(
         config,
@@ -576,14 +593,185 @@ fn ensure_object_exists(path: &Path) -> Result<(), String> {
     }
 }
 
+fn current_memlock_limits() -> io::Result<MemlockLimits> {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limits` points to writable storage for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limits) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(MemlockLimits {
+        soft: limits.rlim_cur,
+        hard: limits.rlim_max,
+    })
+}
+
+fn raise_memlock_limit() -> Result<MemlockLimits, String> {
+    let before = current_memlock_limits()
+        .map_err(|error| format!("failed to read RLIMIT_MEMLOCK before loading BPF: {error}"))?;
+    if before.soft == libc::RLIM_INFINITY && before.hard == libc::RLIM_INFINITY {
+        return Ok(before);
+    }
+
+    let unlimited = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: `unlimited` is a valid immutable rlimit value.
+    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlimited) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(format!(
+            "failed to raise RLIMIT_MEMLOCK from {} to unlimited before loading BPF: {error}. TraceLens needs a Polkit/root launch with permission to raise the locked-memory limit",
+            format_memlock_limits(before)
+        ));
+    }
+
+    let after = current_memlock_limits()
+        .map_err(|error| format!("raised RLIMIT_MEMLOCK but could not verify it: {error}"))?;
+    if after.soft != libc::RLIM_INFINITY || after.hard != libc::RLIM_INFINITY {
+        return Err(format!(
+            "failed to raise RLIMIT_MEMLOCK to unlimited before loading BPF; effective limit is {}",
+            format_memlock_limits(after)
+        ));
+    }
+    Ok(after)
+}
+
+fn format_memlock_value(value: libc::rlim_t) -> String {
+    if value == libc::RLIM_INFINITY {
+        "unlimited".to_owned()
+    } else {
+        format!("{} KiB", value / 1024)
+    }
+}
+
+fn format_memlock_limits(limits: MemlockLimits) -> String {
+    format!(
+        "soft={}, hard={}",
+        format_memlock_value(limits.soft),
+        format_memlock_value(limits.hard)
+    )
+}
+
+fn libbpf_log_callback(level: PrintLevel, message: String) {
+    eprint!("libbpf[{level:?}]: {message}");
+    if let Ok(mut log) = LIBBPF_LOG.lock() {
+        log.push_str(&message);
+        if log.len() > LIBBPF_LOG_LIMIT {
+            let mut split = log.len() - LIBBPF_LOG_LIMIT;
+            while !log.is_char_boundary(split) {
+                split += 1;
+            }
+            log.drain(..split);
+        }
+    }
+}
+
+fn initialize_libbpf_logging() {
+    LIBBPF_LOG_INIT.call_once(|| {
+        set_print(Some((PrintLevel::Info, libbpf_log_callback)));
+    });
+}
+
+fn clear_libbpf_log() {
+    if let Ok(mut log) = LIBBPF_LOG.lock() {
+        log.clear();
+    }
+}
+
+fn captured_libbpf_log() -> String {
+    LIBBPF_LOG.lock().map(|log| log.clone()).unwrap_or_default()
+}
+
+fn libbpf_failure_detail(log: &str) -> Option<String> {
+    const SPECIFIC_MARKERS: &[&str] = &[
+        "min value is negative",
+        "invalid access",
+        "invalid mem access",
+        "unknown func",
+        "BTF is required",
+        "failed to find BTF",
+        "invalid BTF",
+        "not supported by the kernel",
+    ];
+    for marker in SPECIFIC_MARKERS {
+        if let Some(line) = log.lines().find(|line| line.contains(marker)) {
+            return Some(line.trim().to_owned());
+        }
+    }
+    log.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && (line.contains("failed")
+                    || line.contains("permission")
+                    || line.contains("not supported"))
+        })
+        .map(str::to_owned)
+}
+
+fn classify_load_failure(kind: ErrorKind, log: &str, limits: MemlockLimits) -> String {
+    let lower = log.to_ascii_lowercase();
+    let category = if lower.contains("memlock")
+        || lower.contains("locked memory")
+        || lower.contains("can't lock memory")
+    {
+        "insufficient memlock while creating BPF maps"
+    } else if lower.contains("btf") {
+        "BTF or kernel compatibility rejection"
+    } else if lower.contains("-- begin prog load log --")
+        || lower.contains("verifier")
+        || lower.contains("processed ")
+    {
+        "BPF verifier or kernel compatibility rejection"
+    } else if kind == ErrorKind::PermissionDenied {
+        "BPF permission/capability rejection"
+    } else {
+        "BPF object, BTF, verifier, or kernel compatibility rejection"
+    };
+    let detail = libbpf_failure_detail(log)
+        .map(|detail| format!("; libbpf detail: {detail}"))
+        .unwrap_or_default();
+    format!(
+        "{category}; RLIMIT_MEMLOCK {}; full libbpf verifier output was written to Core stderr{detail}",
+        format_memlock_limits(limits)
+    )
+}
+
 fn load_object(path: &Path) -> Result<Object, String> {
+    File::open(path).map_err(|error| {
+        format!(
+            "BPF object file is not readable at {}: {error}",
+            path.display()
+        )
+    })?;
+    let limits = current_memlock_limits().map_err(|error| {
+        format!(
+            "failed to inspect RLIMIT_MEMLOCK before loading {}: {error}",
+            path.display()
+        )
+    })?;
+    let _load_guard = LIBBPF_LOAD_LOCK
+        .lock()
+        .map_err(|_| "libbpf object load lock is poisoned".to_owned())?;
+    initialize_libbpf_logging();
+    clear_libbpf_log();
     let mut builder = ObjectBuilder::default();
     let open_object = builder
         .open_file(path)
-        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-    open_object
-        .load()
-        .map_err(|error| format!("failed to load {}: {error}", path.display()))
+        .map_err(|error| {
+            format!(
+                "failed to parse BPF object {}: {error}. The file is readable; check ELF/BTF format and libbpf compatibility",
+                path.display()
+            )
+        })?;
+    open_object.load().map_err(|error| {
+        let diagnosis = classify_load_failure(error.kind(), &captured_libbpf_log(), limits);
+        format!("failed to load {}: {error}; {diagnosis}", path.display())
+    })
 }
 
 fn attach_program(object: &mut Object, name: &str) -> Result<Link, String> {
@@ -1018,9 +1206,10 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_address, is_dns_dependency_name, kernel_capture_config, parse_dns_message,
-        KernelDnsEvent, KernelNetworkEvent, KernelProcessEvent, KernelRuntimeController,
-        KernelRuntimeState, CONNECTION_PROGRAMS, FILE_PROGRAMS, PROCESS_PROGRAMS, SCOPE_COMM,
+        classify_load_failure, decode_address, format_memlock_limits, is_dns_dependency_name,
+        kernel_capture_config, libbpf_failure_detail, parse_dns_message, KernelDnsEvent,
+        KernelNetworkEvent, KernelProcessEvent, KernelRuntimeController, KernelRuntimeState,
+        MemlockLimits, CONNECTION_PROGRAMS, FILE_PROGRAMS, PROCESS_PROGRAMS, SCOPE_COMM,
         SCOPE_GLOBAL, SCOPE_PID, TRAFFIC_PROGRAMS,
     };
     use crate::capture::{CaptureFeatures, CaptureModule, CaptureProfile};
@@ -1104,6 +1293,57 @@ mod tests {
         assert!(is_dns_dependency_name("systemd-resolve"));
         assert!(is_dns_dependency_name("dnsmasq"));
         assert!(!is_dns_dependency_name("curl"));
+    }
+
+    #[test]
+    fn verifier_failure_is_not_reported_as_file_permission_failure() {
+        let log =
+            "libbpf: -- BEGIN PROG LOAD LOG --\nR2 min value is negative\nprocessed 339 insns\n";
+        let diagnosis = classify_load_failure(
+            libbpf_rs::ErrorKind::PermissionDenied,
+            log,
+            MemlockLimits {
+                soft: libc::RLIM_INFINITY,
+                hard: libc::RLIM_INFINITY,
+            },
+        );
+        assert!(diagnosis.contains("verifier or kernel compatibility"));
+        assert!(diagnosis.contains("R2 min value is negative"));
+        assert!(!diagnosis.contains("insufficient memlock"));
+    }
+
+    #[test]
+    fn load_diagnostics_distinguish_memlock_btf_and_capabilities() {
+        let limits = MemlockLimits {
+            soft: 8 * 1024 * 1024,
+            hard: 8 * 1024 * 1024,
+        };
+        assert!(classify_load_failure(
+            libbpf_rs::ErrorKind::PermissionDenied,
+            "failed to create map: RLIMIT_MEMLOCK too low",
+            limits,
+        )
+        .starts_with("insufficient memlock"));
+        assert!(classify_load_failure(
+            libbpf_rs::ErrorKind::InvalidData,
+            "failed to find BTF for kernel type",
+            limits,
+        )
+        .starts_with("BTF or kernel compatibility"));
+        assert!(classify_load_failure(
+            libbpf_rs::ErrorKind::PermissionDenied,
+            "Operation not permitted",
+            limits,
+        )
+        .starts_with("BPF permission/capability"));
+        assert_eq!(
+            format_memlock_limits(limits),
+            "soft=8192 KiB, hard=8192 KiB"
+        );
+        assert_eq!(
+            libbpf_failure_detail("noise\ninvalid access to map value\nmore noise"),
+            Some("invalid access to map value".to_owned())
+        );
     }
 
     #[test]
