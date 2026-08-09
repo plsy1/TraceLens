@@ -120,10 +120,21 @@ jobs:
               exit 1
             fi
           else
+            release_notes="$(printf '%s\n\n%s\n\n%s\n%s\n%s\n\n%s\n%s\n%s\n\n%s\n%s' \
+              "TraceLens $RELEASE_TAG is a Linux x86_64 desktop release." \
+              "## Packages" \
+              "- Debian/Ubuntu: install the \`amd64.deb\` package." \
+              "- Portable Linux: make the \`amd64.AppImage\` executable and run it." \
+              "- Use \`SHA256SUMS\` to verify downloaded artifacts." \
+              "## Notes" \
+              "TraceLens starts idle. Select a target and capture modules in the application before starting a capture." \
+              "Live observation requires administrator authorization for eBPF probes." \
+              "## Source" \
+              "https://github.com/${{ github.repository }}/tree/$RELEASE_TAG")"
             gh release create "$RELEASE_TAG" \
               --draft \
               --verify-tag \
-              --generate-notes \
+              --notes "$release_notes" \
               --title "TraceLens $RELEASE_TAG"
           fi
           gh release upload "$RELEASE_TAG" dist/* --clobber
