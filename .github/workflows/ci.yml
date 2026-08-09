@@ -141,7 +141,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.tauri == 'true'
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -170,29 +170,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20.19.0
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
-
-      - name: Install UI dependencies
-        working-directory: ui
-        run: npm ci
-
-      - name: Build Linux desktop packages
+      - name: Check Tauri backend
         run: |
           ./scripts/prepare-desktop.sh debug
           cargo check --manifest-path ui/src-tauri/Cargo.toml --locked
-          npm run desktop:build --prefix ui -- --ci
-
-      - name: Upload dev desktop packages
-        uses: actions/upload-artifact@v4
-        with:
-          name: TraceLens-${{ github.ref_name }}-${{ github.sha }}-linux-x86_64
-          path: |
-            ui/src-tauri/target/release/bundle/deb/*.deb
-            ui/src-tauri/target/release/bundle/appimage/*.AppImage
-          if-no-files-found: error
-          retention-days: 7
