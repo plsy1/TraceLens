@@ -1,9 +1,19 @@
 use std::env;
-use std::sync::{mpsc, Arc, Mutex, TryLockError};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tracelens_core::{config::CliOptions, Core};
+
+// Global Web capture can briefly burst while provider discovery starts helper
+// processes. Keep enough bounded headroom for that startup burst without
+// returning to the unbounded memory growth of the old channel.
+const EVENT_QUEUE_CAPACITY: usize = 2_048;
+// Keep the Core mutex available to API readers during a busy global capture.
+// The bounded queue absorbs bursts; smaller batches prevent a full 2,048-event
+// drain from blocking every Web UI refresh for hundreds of milliseconds.
+const EVENT_BATCH_LIMIT: usize = 256;
+const USERSPACE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 fn main() {
     let options = CliOptions::from_args(env::args().skip(1));
@@ -88,7 +98,7 @@ fn run_observer(options: CliOptions) {
             return;
         }
     };
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = tracelens_core::runtime::event_channel(EVENT_QUEUE_CAPACITY);
 
     if let Ok(mut core) = core.lock() {
         core.set_probe_event_sender(sender.clone());
@@ -109,7 +119,6 @@ fn run_observer(options: CliOptions) {
     println!("BPF object directory: {}", config.bpf_object_dir.display());
     println!("API: http://{api_listen}");
 
-    const EVENT_BATCH_LIMIT: usize = 256;
     let mut last_userspace_refresh = Instant::now();
     loop {
         let mut events = Vec::with_capacity(EVENT_BATCH_LIMIT);
@@ -121,22 +130,14 @@ fn run_observer(options: CliOptions) {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        let core_guard = loop {
-            match core.try_lock() {
-                Ok(core) => break Some(core),
-                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
-                Err(TryLockError::Poisoned(_)) => break None,
-            }
-        };
-        if let Some(mut core) = core_guard {
+        if let Ok(mut core) = core.lock() {
             for event in events {
                 core.ingest_event(event);
             }
-            if last_userspace_refresh.elapsed() >= Duration::from_secs(2) {
+            if last_userspace_refresh.elapsed() >= USERSPACE_REFRESH_INTERVAL {
                 core.refresh_userspace_probes();
                 last_userspace_refresh = Instant::now();
             }
         }
-        thread::yield_now();
     }
 }

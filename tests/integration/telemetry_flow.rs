@@ -12,7 +12,8 @@ use tracelens_core::{
 };
 use tracelens_events::{
     ConnectionRef, ConnectionState, Endpoint, EventKind, EventSource, FileEventData,
-    PlaintextDirection, PlaintextEventData, TcpState, TlsEventData, TraceEvent, TransportProtocol,
+    HttpCaptureEventData, PlaintextDirection, PlaintextEventData, TcpState, TlsEventData,
+    TraceEvent, TransportProtocol,
 };
 
 const PID: u32 = 4242;
@@ -385,11 +386,11 @@ fn parses_http_messages_from_reassembled_plaintext() {
     core.ingest_event(TraceEvent::http_capture(
         EventSource::Kernel,
         PID,
-        PlaintextEventData {
+        HttpCaptureEventData {
             ssl_object: 0x5678,
             fd: Some(fd as i32),
             direction: PlaintextDirection::Write,
-            data: "GET /health HTTP/1.1\r\nHost: example.net\r\n".to_owned(),
+            data: b"GET /health HTTP/1.1\r\nHost: example.net\r\n".to_vec(),
             bytes: 43,
             truncated: false,
         },
@@ -399,11 +400,11 @@ fn parses_http_messages_from_reassembled_plaintext() {
         TraceEvent::http_capture(
             EventSource::Kernel,
             PID,
-            PlaintextEventData {
+            HttpCaptureEventData {
                 ssl_object: 0x5678,
                 fd: Some(fd as i32),
                 direction: PlaintextDirection::Write,
-                data: "User-Agent: tracelens\r\n\r\n".to_owned(),
+                data: b"User-Agent: tracelens\r\n\r\n".to_vec(),
                 bytes: 26,
                 truncated: false,
             },
@@ -418,11 +419,11 @@ fn parses_http_messages_from_reassembled_plaintext() {
     core.ingest_event(TraceEvent::http_capture(
         EventSource::Kernel,
         PID,
-        PlaintextEventData {
+        HttpCaptureEventData {
             ssl_object: 0x5678,
             fd: Some(fd as i32),
             direction: PlaintextDirection::Read,
-            data: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no".to_owned(),
+            data: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no".to_vec(),
             bytes: 46,
             truncated: false,
         },
@@ -431,11 +432,11 @@ fn parses_http_messages_from_reassembled_plaintext() {
     core.ingest_event(TraceEvent::http_capture(
         EventSource::Kernel,
         PID,
-        PlaintextEventData {
+        HttpCaptureEventData {
             ssl_object: 0x5678,
             fd: Some(fd as i32),
             direction: PlaintextDirection::Read,
-            data: "k".to_owned(),
+            data: b"k".to_vec(),
             bytes: 1,
             truncated: false,
         },
@@ -464,6 +465,10 @@ fn parses_http_messages_from_reassembled_plaintext() {
         .entries
         .iter()
         .all(|entry| entry.connection_id.as_deref() == Some(socket_id.as_str())));
+    assert!(page
+        .entries
+        .iter()
+        .all(|entry| entry.http_stream_id.as_deref() == Some(socket_id.as_str())));
     assert_eq!(core.http_stream_count(), 1);
 }
 

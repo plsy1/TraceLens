@@ -1,4 +1,5 @@
 pub mod bpftime;
+pub mod ingress;
 pub mod kernel;
 pub mod provider;
 pub mod selector;
@@ -9,6 +10,7 @@ use std::fmt;
 use crate::capture::{CaptureFeatures, CaptureModule};
 use crate::observation::ObservationLevel;
 
+pub use ingress::{event_channel, EventQueueStats, EventSender};
 pub use userspace::{ProbeAttachment, ProbeRuntime, UserspaceProbeDiagnostics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

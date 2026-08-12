@@ -20,8 +20,9 @@ traffic, and stop or reset the session when finished.
 - Keeps capture data in memory by default. SQLite history is opt-in.
 
 Payload capture is intentionally bounded. Small textual HTTP bodies such as
-HTML, JSON, XML, JavaScript, and CSS can be previewed; large, binary, media,
-archive, or compressed content is represented by metadata and byte counts.
+HTML, JSON, XML, JavaScript, and CSS can be previewed. TraceLens decodes bounded
+gzip, deflate, Brotli, and Zstandard responses; large, binary, media, archive,
+or unsupported encoded content is represented by metadata and byte counts.
 
 ## Capture profiles and modules
 
@@ -53,9 +54,11 @@ scripts/        Build and development helpers
 ```
 
 The kernel runtime emits events through BPF ring buffers. The Rust `core`
-process decodes and correlates them, maintains bounded in-memory read models,
-and serves the local API. Userspace probes are loaded through bpftime when
-available, with a kernel-uProbe fallback on Linux.
+process moves them through a bounded, non-blocking ingress queue, decodes and
+correlates them, maintains bounded in-memory read models, and serves the local
+API. Queue drops and userspace ring-buffer delivery counters are exposed by
+`/api/health`. Userspace probes are loaded through bpftime when available,
+with a kernel-uProbe fallback on Linux.
 
 ## Prerequisites
 
@@ -103,10 +106,10 @@ Open the URL printed by Vite from another machine. In the capture console:
 5. Generate traffic, inspect the active workspace, then press `Stop`.
 6. Press `Reset` to discard the in-memory session and start a fresh capture.
 
-The capture workspace shows one view at a time: Connections, Processes,
-Sessions, or Raw events. Tables support sorting, pagination, and draggable
-column widths. Payload details open in a bounded modal instead of loading
-large files into the browser.
+The capture workspace shows one view at a time: HTTP requests, Connections,
+Processes, or Raw events. Tables support sorting, pagination, and draggable
+column widths. Connection and payload details open in bounded modals instead
+of loading large files into the browser.
 
 ## Linux desktop application
 
@@ -226,8 +229,9 @@ cd ui && npm run build
 On a Linux host with passwordless BPF privileges, run the isolated runtime
 acceptance test with `./scripts/privileged-e2e.sh`.
 
-More detailed engineering notes are available in
-[`docs/architecture.md`](docs/architecture.md),
+The focused product direction is documented in
+[`docs/product_direction.md`](docs/product_direction.md). More detailed
+engineering notes are available in [`docs/architecture.md`](docs/architecture.md),
 [`docs/deployment.md`](docs/deployment.md), and
 [`docs/development_workflow.md`](docs/development_workflow.md). The tag-driven
 GitHub Release process is documented in

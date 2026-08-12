@@ -11,13 +11,12 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tracelens_events::TraceEvent;
 
 use super::provider::{TlsCapability, TlsProvider};
-use super::ProbeKind;
+use super::{EventSender, ProbeKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTarget {
@@ -297,7 +296,7 @@ pub struct BpftimeRuntime {
     version: Option<String>,
     detail: String,
     managed: Vec<ManagedProvider>,
-    event_sender: Option<Sender<TraceEvent>>,
+    event_sender: Option<EventSender>,
 }
 
 impl Default for BpftimeRuntime {
@@ -375,7 +374,7 @@ impl BpftimeRuntime {
         &self.detail
     }
 
-    pub fn set_event_sender(&mut self, sender: Sender<TraceEvent>) {
+    pub fn set_event_sender(&mut self, sender: EventSender) {
         self.event_sender = Some(sender);
     }
 
@@ -491,7 +490,7 @@ impl BpftimeRuntime {
                             instrumentation.provider.clone_from(&provider_name);
                             instrumentation.library.clone_from(&provider_library);
                         }
-                        let _ = sender.send(event);
+                        sender.try_send(event);
                     }
                 }
             })

@@ -145,6 +145,7 @@ pub struct TimelineEntry {
     pub plaintext_skipped: bool,
     pub plaintext_skip_reason: Option<String>,
     pub http_direction: Option<HttpMessageDirection>,
+    pub http_stream_id: Option<String>,
     pub http_version: Option<String>,
     pub http_method: Option<String>,
     pub http_target: Option<String>,
@@ -209,6 +210,7 @@ impl TimelineEntry {
             plaintext_skipped: false,
             plaintext_skip_reason: None,
             http_direction: None,
+            http_stream_id: None,
             http_version: None,
             http_method: None,
             http_target: None,
@@ -325,6 +327,7 @@ impl TimelineEntry {
                 truncated,
                 payload_skipped,
                 payload_skip_reason,
+                ..
             } => {
                 if let Some(connection) = event.connection.as_ref() {
                     entry.connection_id = Some(connection.id.clone());
@@ -366,7 +369,7 @@ impl TimelineEntry {
                 entry.ssl_object = Some(ssl_object);
                 entry.fd = fd;
                 entry.plaintext_direction = Some(direction);
-                entry.plaintext = Some(data);
+                entry.plaintext = Some(String::from_utf8_lossy(&data).into_owned());
                 entry.plaintext_bytes = Some(bytes);
                 entry.plaintext_truncated = truncated;
                 entry.plaintext_skipped = payload_skipped;
@@ -382,6 +385,7 @@ impl TimelineEntry {
                 );
             }
             EventPayload::Http {
+                stream_id,
                 direction,
                 version,
                 method,
@@ -397,6 +401,7 @@ impl TimelineEntry {
                 payload_skipped,
                 payload_skip_reason,
             } => {
+                entry.http_stream_id = stream_id;
                 if let Some(connection) = event.connection.as_ref() {
                     entry.connection_id = Some(connection.id.clone());
                     entry.remote = Some(connection.remote.clone());

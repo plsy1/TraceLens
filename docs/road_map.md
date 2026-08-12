@@ -6,7 +6,8 @@
 
 ## 产品目标
 
-TraceLens 是一个 Linux 进程感知型网络捕获工具。Core 启动后默认待机，
+TraceLens 是一个 Linux 进程级网络故障诊断与按需抓取工具。产品定位和当前阶段
+的非目标见 [`product_direction.md`](product_direction.md)。Core 启动后默认待机，
 用户选择 PID、进程名或 Global 范围、Capture Profile 和模块，点击 Start 后才
 开始记录本次会话；Stop 停止采集，Reset 丢弃当前内存数据并开始新会话。
 
@@ -28,7 +29,7 @@ TraceLens 需要稳定回答以下问题：
 | Capture 配置 | UI 和 capture API 已使用 Profile + CaptureFeatures；旧 Observation API 仅作迁移兼容 |
 | TLS | 自动检测 OpenSSL-family、GnuTLS、NSS/NSPR、rustls-ffi；统一生成 TLS、HTTP 和有限明文事件 |
 | HTTP | 有界 HTTP/1.1 请求/响应重组和小型文本预览 |
-| UI | Connections、Processes、Sessions、Raw events 独立分页视图；Linux Tauri 桌面包 |
+| UI | HTTP requests、Connections、Processes、Raw events 独立视图；连接详情由 Connections 进入；Linux Tauri 桌面包 |
 | 存储 | 默认有界内存；SQLite 历史可选 |
 | 测试 | Rust 单元测试、集成测试、API 合约测试、UI 构建检查 |
 

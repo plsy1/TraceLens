@@ -34,7 +34,10 @@ use network::ConnectionTracker;
 use observation::ObservationManager;
 use process::{read_process_ref, ProcessTracker};
 use runtime::kernel::{KernelRuntimeController, KernelRuntimeStatus};
-use runtime::{ProbeAttachment, ProbeRuntime, RuntimeStatus, UserspaceProbeDiagnostics};
+use runtime::{
+    EventQueueStats, EventSender, ProbeAttachment, ProbeRuntime, RuntimeStatus,
+    UserspaceProbeDiagnostics,
+};
 use storage::{EventQuery, EventStore};
 use tls::TlsTracker;
 use tracelens_events::{
@@ -95,6 +98,8 @@ pub struct Core {
     capture_plan: CapturePlan,
     observer_capture_mode: bool,
     capture_started_at_ns: Option<u64>,
+    event_queue_stats: Option<EventQueueStats>,
+    event_queue_drop_baseline: u64,
     kernel_runtime: Option<KernelRuntimeController>,
 }
 
@@ -151,6 +156,8 @@ impl Core {
             capture_plan: CapturePlan::network(CaptureScope::Global),
             observer_capture_mode: false,
             capture_started_at_ns: None,
+            event_queue_stats: None,
+            event_queue_drop_baseline: 0,
             kernel_runtime: None,
         }
     }
@@ -254,8 +261,28 @@ impl Core {
         self.http.stream_count()
     }
 
-    pub fn set_probe_event_sender(&mut self, sender: std::sync::mpsc::Sender<TraceEvent>) {
+    pub fn set_probe_event_sender(&mut self, sender: EventSender) {
+        let stats = sender.stats();
+        self.event_queue_drop_baseline = stats.dropped();
+        self.event_queue_stats = Some(stats);
         self.probe_runtime.set_event_sender(sender);
+    }
+
+    pub fn event_queue_capacity(&self) -> Option<usize> {
+        self.event_queue_stats
+            .as_ref()
+            .map(EventQueueStats::capacity)
+    }
+
+    pub fn dropped_probe_events(&self) -> u64 {
+        self.event_queue_stats
+            .as_ref()
+            .map(|stats| {
+                stats
+                    .dropped()
+                    .saturating_sub(self.event_queue_drop_baseline)
+            })
+            .unwrap_or_default()
     }
 
     pub fn tls_metadata_for_connection(
@@ -903,32 +930,38 @@ impl Core {
                 fd,
                 direction,
                 data,
+                raw_data,
                 truncated,
                 ..
-            }
-            | EventPayload::HttpCapture {
+            } => (
+                ssl_object,
+                fd,
+                direction,
+                raw_data.as_deref().unwrap_or(data.as_bytes()),
+                truncated,
+            ),
+            EventPayload::HttpCapture {
                 ssl_object,
                 fd,
                 direction,
                 data,
                 truncated,
                 ..
-            } => (ssl_object, fd, direction, data, truncated),
+            } => (ssl_object, fd, direction, data.as_slice(), truncated),
             _ => return Vec::new(),
         };
         let stream_key = http_stream_key(event, pid, *ssl_object, *fd);
         let Some(stream_key) = stream_key else {
             return Vec::new();
         };
-        let messages = self
-            .http
-            .observe(&stream_key, *direction, data.as_bytes(), *truncated);
+        let messages = self.http.observe(&stream_key, *direction, data, *truncated);
         messages
             .into_iter()
             .enumerate()
             .map(|(sequence, message)| {
                 let data = match message {
                     HttpMessage::Request(request) => HttpEventData {
+                        stream_id: Some(stream_key.clone()),
                         direction: HttpMessageDirection::Request,
                         version: request.version.as_str().to_owned(),
                         method: Some(request.method),
@@ -949,6 +982,7 @@ impl Core {
                         payload_skip_reason: request.body.skip_reason,
                     },
                     HttpMessage::Response(response) => HttpEventData {
+                        stream_id: Some(stream_key.clone()),
                         direction: HttpMessageDirection::Response,
                         version: response.version.as_str().to_owned(),
                         method: None,
@@ -1015,11 +1049,17 @@ impl Core {
         match &mut event.payload {
             EventPayload::Plaintext {
                 data,
+                raw_data,
                 payload_skipped,
                 payload_skip_reason,
                 ..
+            } => {
+                data.clear();
+                *raw_data = None;
+                *payload_skipped = true;
+                *payload_skip_reason = Some(reason.to_owned());
             }
-            | EventPayload::HttpCapture {
+            EventPayload::HttpCapture {
                 data,
                 payload_skipped,
                 payload_skip_reason,
@@ -1224,6 +1264,11 @@ impl Core {
     pub fn try_start_capture(&mut self) -> Result<CaptureState, String> {
         if !self.is_capturing() {
             let started_at_ns = self.observer_capture_mode.then(monotonic_now_ns);
+            self.event_queue_drop_baseline = self
+                .event_queue_stats
+                .as_ref()
+                .map(EventQueueStats::dropped)
+                .unwrap_or_default();
             if let Some(runtime) = &self.kernel_runtime {
                 runtime.apply_plan(self.capture_plan.effective, self.capture_scope.clone())?;
             }

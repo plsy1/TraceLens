@@ -135,7 +135,14 @@ static __always_inline int emit_dns_event(
     __u32 buffer_length)
 {
     struct tracelens_dns_event *event;
-    __u32 payload_size = buffer_length;
+    /*
+     * Keep the helper size in a 64-bit scalar. Some kernels retain a
+     * potentially negative upper half after 32-bit bounds checks and reject
+     * bpf_probe_read_user() even though the C value is an unsigned __u32.
+     */
+    __u64 payload_size = (__u64)buffer_length;
+
+    barrier_var(payload_size);
 
     if (!buffer || payload_size < 12) {
         return 0;
@@ -164,7 +171,7 @@ static __always_inline int emit_dns_event(
     event->pid = pid;
     event->socket_id = ((__u64)pid << 32) | fd;
     event->timestamp_ns = bpf_ktime_get_ns();
-    event->payload_size = payload_size;
+    event->payload_size = (__u32)payload_size;
     bpf_ringbuf_submit(event, 0);
     return 0;
 }

@@ -97,6 +97,7 @@ type TimelineEntry = {
   plaintext_skipped?: boolean;
   plaintext_skip_reason?: string | null;
   http_direction?: string | null;
+  http_stream_id?: string | null;
   http_version?: string | null;
   http_method?: string | null;
   http_target?: string | null;
@@ -120,6 +121,12 @@ type TimelinePage = {
   offset: number;
   limit: number;
   has_more: boolean;
+};
+
+type HttpTransaction = {
+  id: string;
+  request: TimelineEntry | null;
+  response: TimelineEntry | null;
 };
 
 type ConnectionTimeline = {
@@ -172,9 +179,7 @@ type ProcessSortKey = "name" | "pid" | "connections" | "traffic";
 type ConnectionSortKey = "process" | "pid" | "remote" | "domain" | "state" | "traffic" | "last_seen";
 type ProcessColumnKey = ProcessSortKey;
 type ConnectionColumnKey = ConnectionSortKey | "trace";
-type SessionColumnKey = "route" | "state" | "details" | "id" | "inspect";
-type SessionSortKey = Exclude<SessionColumnKey, "inspect"> | "last_seen";
-type WorkspaceView = "processes" | "connections" | "sessions" | "timeline";
+type WorkspaceView = "http" | "processes" | "connections" | "timeline";
 
 type DesktopStatus = {
   core_ready: boolean;
@@ -252,9 +257,9 @@ function closeModuleDependencies(modules: CaptureModule[]): CaptureModule[] {
 }
 
 const workspaceTabs: Array<{ id: WorkspaceView; label: string; hint: string }> = [
+  { id: "http", label: "HTTP requests", hint: "request and response pairs" },
   { id: "connections", label: "Connections", hint: "network edges" },
   { id: "processes", label: "Processes", hint: "live inventory" },
-  { id: "sessions", label: "Sessions", hint: "connection activity" },
   { id: "timeline", label: "Raw events", hint: "advanced view" },
 ];
 
@@ -274,14 +279,6 @@ const defaultConnectionColumnWidths: Record<ConnectionColumnKey, number> = {
   traffic: 130,
   last_seen: 130,
   trace: 100,
-};
-
-const defaultSessionColumnWidths: Record<SessionColumnKey, number> = {
-  route: 270,
-  state: 110,
-  details: 450,
-  id: 230,
-  inspect: 110,
 };
 
 const demoSummary: Summary = {
@@ -387,24 +384,6 @@ function buildTimelinePath(kind: string, pid: string, connectionId: string, offs
   if (/^\d+$/.test(pid.trim())) params.set("pid", pid.trim());
   if (connectionId.trim()) params.set("connection_id", connectionId.trim());
   return `/api/timeline?${params.toString()}`;
-}
-
-function buildConnectionTimelinePath(
-  offset: number,
-  includeClosed: boolean,
-  includePlaintext: boolean,
-  sort: SortState<SessionSortKey>,
-): string {
-  const params = new URLSearchParams({
-    limit: "20",
-    offset: String(offset),
-    include_closed: String(includeClosed),
-    include_events: "false",
-    include_plaintext: String(includePlaintext),
-    sort: sort.key,
-    direction: sort.direction,
-  });
-  return `/api/connection-timeline?${params.toString()}`;
 }
 
 function buildConnectionDetailPath(connectionId: string, includePlaintext: boolean): string {
@@ -524,31 +503,6 @@ function SortableHeader<Key extends string>({
       </button>
       {onResizeStart && <ColumnResizer label={label} onResizeStart={onResizeStart} />}
     </th>
-  );
-}
-
-function SessionSortableHeader({
-  label,
-  column,
-  sort,
-  onSort,
-  onResizeStart,
-}: {
-  label: string;
-  column: Exclude<SessionColumnKey, "inspect">;
-  sort: SortState<SessionSortKey>;
-  onSort: (column: Exclude<SessionColumnKey, "inspect">) => void;
-  onResizeStart: (clientX: number) => void;
-}) {
-  const active = sort.key === column;
-  return (
-    <div className="session-header-cell" aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
-      <button type="button" className={`sort-button ${active ? "active" : ""}`} onClick={() => onSort(column)}>
-        <span>{label}</span>
-        <span className="sort-indicator" aria-hidden="true">{active ? (sort.direction === "asc" ? "↑" : "↓") : "↕"}</span>
-      </button>
-      <ColumnResizer label={label} onResizeStart={onResizeStart} />
-    </div>
   );
 }
 
@@ -681,6 +635,76 @@ function payloadBytes(entry: TimelineEntry): number | null {
   return entry.http_body_bytes ?? entry.plaintext_bytes ?? null;
 }
 
+function httpBodyEmptyMessage(entry: TimelineEntry): string {
+  if (entry.http_payload_skipped) {
+    const reason = entry.http_payload_skip_reason ?? "unsupported";
+    const messages: Record<string, string> = {
+      binary_content: "Binary response body is intentionally hidden.",
+      body_too_large: "Text body exceeds the 64 KB preview limit.",
+      unsupported_content_type: "This response content type is not displayed as text.",
+      unknown_content_type: "The response has no recognizable text content type.",
+      unsupported_content_encoding: "This response uses an unsupported content encoding.",
+      invalid_content_encoding: "The compressed response body could not be decoded.",
+      unsupported_text_encoding: "The response character encoding is not supported.",
+    };
+    return messages[reason] ?? `Body skipped: ${stateLabel(reason)}.`;
+  }
+  if (entry.http_direction === "request" && ["GET", "HEAD", "DELETE", "OPTIONS"].includes(entry.http_method ?? "")) {
+    return `${entry.http_method} requests normally do not contain a body.`;
+  }
+  if (entry.http_content_length === 0 || [204, 304].includes(entry.http_status ?? -1)) {
+    return "This HTTP message has no body.";
+  }
+  return "No text body was captured for this HTTP message.";
+}
+
+function pairHttpTransactions(entries: TimelineEntry[]): HttpTransaction[] {
+  const pending = new Map<string, TimelineEntry[]>();
+  const transactions: HttpTransaction[] = [];
+
+  entries
+    .filter((entry) => entry.kind === "http" && entry.http_direction)
+    .sort((left, right) => left.timestamp_ns - right.timestamp_ns)
+    .forEach((entry) => {
+      const key = entry.connection_id ?? entry.http_stream_id ?? `pid:${entry.pid ?? "unknown"}`;
+      if (entry.http_direction === "request") {
+        const requests = pending.get(key) ?? [];
+        requests.push(entry);
+        pending.set(key, requests);
+        return;
+      }
+
+      const request = pending.get(key)?.shift() ?? null;
+      transactions.push({
+        id: request ? `${request.id}:${entry.id}` : entry.id,
+        request,
+        response: entry,
+      });
+    });
+
+  pending.forEach((requests) => {
+    requests.forEach((request) => transactions.push({ id: request.id, request, response: null }));
+  });
+
+  return transactions.sort((left, right) => {
+    const leftTime = left.response?.timestamp_ns ?? left.request?.timestamp_ns ?? 0;
+    const rightTime = right.response?.timestamp_ns ?? right.request?.timestamp_ns ?? 0;
+    return rightTime - leftTime;
+  });
+}
+
+function httpTransactionDuration(transaction: HttpTransaction): string {
+  if (!transaction.request || !transaction.response) return "—";
+  const milliseconds = Math.max(0, transaction.response.timestamp_ns - transaction.request.timestamp_ns) / 1_000_000;
+  if (milliseconds < 1_000) return `${milliseconds.toFixed(milliseconds < 10 ? 1 : 0)} ms`;
+  return `${(milliseconds / 1_000).toFixed(2)} s`;
+}
+
+function httpContentType(entry: TimelineEntry | null): string {
+  const value = entry?.http_headers?.find((header) => header.name.toLowerCase() === "content-type")?.value;
+  return value?.split(";", 1)[0] ?? "—";
+}
+
 function App() {
   const [desktopBoot, setDesktopBoot] = useState<DesktopBootState>(() => IS_DESKTOP
     ? { phase: "starting", message: "Waiting for administrator authorization…" }
@@ -710,14 +734,14 @@ function App() {
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [connectionEventsLoadingId, setConnectionEventsLoadingId] = useState<string | null>(null);
   const [selectedPayloadEntry, setSelectedPayloadEntry] = useState<TimelineEntry | null>(null);
+  const [selectedHttpTransaction, setSelectedHttpTransaction] = useState<HttpTransaction | null>(null);
+  const [httpSearch, setHttpSearch] = useState("");
+  const [httpStatusFilter, setHttpStatusFilter] = useState("all");
   const [processSort, setProcessSort] = useState<SortState<ProcessSortKey>>({ key: "connections", direction: "desc" });
   const [processColumnWidths, setProcessColumnWidths] = useState<Record<ProcessColumnKey, number>>(defaultProcessColumnWidths);
   const [processPageIndex, setProcessPageIndex] = useState(0);
   const [connectionSort, setConnectionSort] = useState<SortState<ConnectionSortKey>>({ key: "last_seen", direction: "desc" });
   const [connectionColumnWidths, setConnectionColumnWidths] = useState<Record<ConnectionColumnKey, number>>(defaultConnectionColumnWidths);
-  const [connectionTimelineOffset, setConnectionTimelineOffset] = useState(0);
-  const [sessionColumnWidths, setSessionColumnWidths] = useState<Record<SessionColumnKey, number>>(defaultSessionColumnWidths);
-  const [sessionSort, setSessionSort] = useState<SortState<SessionSortKey>>({ key: "last_seen", direction: "desc" });
   const [connectionPageIndex, setConnectionPageIndex] = useState(0);
   const [timelineOffset, setTimelineOffset] = useState(0);
   const [selectedConnectionCache, setSelectedConnectionCache] = useState<ConnectionTimeline | null>(null);
@@ -726,8 +750,8 @@ function App() {
   const columnResizeCleanupRef = useRef<(() => void) | null>(null);
   const processTableRef = useRef<HTMLDivElement>(null);
   const connectionTableRef = useRef<HTMLDivElement>(null);
-  const sessionListRef = useRef<HTMLDivElement>(null);
   const timelineListRef = useRef<HTMLDivElement>(null);
+  const workspaceViewInitializedRef = useRef(false);
   const pendingScrollSnapshotRef = useRef<ScrollSnapshot | null>(null);
 
   const startDesktopCore = useCallback(async () => {
@@ -791,34 +815,12 @@ function App() {
     document.body.classList.add("column-resizing");
   }, [connectionColumnWidths]);
 
-  const beginSessionColumnResize = useCallback((column: SessionColumnKey, clientX: number) => {
-    columnResizeCleanupRef.current?.();
-    const startWidth = sessionColumnWidths[column];
-    const handleMove = (event: PointerEvent) => {
-      const nextWidth = Math.max(90, Math.round(startWidth + event.clientX - clientX));
-      setSessionColumnWidths((current) => current[column] === nextWidth
-        ? current
-        : { ...current, [column]: nextWidth });
-    };
-    const cleanup = () => {
-      window.removeEventListener("pointermove", handleMove);
-      window.removeEventListener("pointerup", cleanup);
-      document.body.classList.remove("column-resizing");
-      if (columnResizeCleanupRef.current === cleanup) columnResizeCleanupRef.current = null;
-    };
-    columnResizeCleanupRef.current = cleanup;
-    window.addEventListener("pointermove", handleMove);
-    window.addEventListener("pointerup", cleanup);
-    document.body.classList.add("column-resizing");
-  }, [sessionColumnWidths]);
-
   useEffect(() => () => columnResizeCleanupRef.current?.(), []);
 
   const captureScrollSnapshot = useCallback((): ScrollSnapshot => {
     const containers = [
       processTableRef.current,
       connectionTableRef.current,
-      sessionListRef.current,
       timelineListRef.current,
     ].filter((element): element is HTMLDivElement => element !== null);
 
@@ -888,11 +890,7 @@ function App() {
     ),
     [showPlaintextFragments, timelineConnection, timelineKind, timelineOffset, timelinePid],
   );
-  const connectionTimelineRequestPath = useMemo(
-    () => buildConnectionTimelinePath(connectionTimelineOffset, showClosedConnections, showPlaintextFragments, sessionSort),
-    [connectionTimelineOffset, sessionSort, showClosedConnections, showPlaintextFragments],
-  );
-
+  const httpRequestPath = "/api/timeline?kind=http&limit=200&offset=0&include_plaintext=false";
   const refresh = useCallback(async () => {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
@@ -902,12 +900,15 @@ function App() {
       const needsCandidates = snapshot.mode !== "live"
         || (snapshot.summary.capture_state === "stopped" && !captureWorkspaceActive);
       const needsTlsDiagnostics = snapshot.summary.capture_state === "capturing" || captureWorkspaceActive;
-      const [summary, processes, connections, connectionTimeline, timeline, candidates, health] = await Promise.all([
+      const [summary, processes, connections, timeline, candidates, health] = await Promise.all([
         fetchJson<Summary>("/api/summary"),
         activeView === "processes" ? fetchJson<ProcessRow[]>("/api/processes") : Promise.resolve(null),
         activeView === "connections" ? fetchJson<ConnectionRow[]>("/api/connections") : Promise.resolve(null),
-        activeView === "sessions" ? fetchJson<ConnectionTimelinePage>(connectionTimelineRequestPath) : Promise.resolve(null),
-        activeView === "timeline" ? fetchJson<TimelinePage>(timelineRequestPath) : Promise.resolve(null),
+        activeView === "timeline"
+          ? fetchJson<TimelinePage>(timelineRequestPath)
+          : activeView === "http"
+            ? fetchJson<TimelinePage>(httpRequestPath)
+            : Promise.resolve(null),
         needsCandidates ? fetchJson<ProcessCandidate[]>('/api/process-candidates') : Promise.resolve(null),
         needsTlsDiagnostics ? fetchJson<RuntimeHealth>('/api/health') : Promise.resolve(null),
       ]);
@@ -923,28 +924,9 @@ function App() {
         summary,
         processes: processes ?? current.processes,
         connections: connections ?? current.connections,
-        connection_timeline: connectionTimeline
-          ? {
-              ...connectionTimeline,
-              sessions: connectionTimeline.sessions.map((session) => {
-                const previous = current.connection_timeline.sessions.find((item) => item.id === session.id);
-                const previousEvents = previous?.events.filter((event) => showPlaintextFragments || event.kind !== "plaintext") ?? [];
-                return previous && previousEvents.length > session.events.length
-                  ? { ...session, events: previousEvents }
-                  : session;
-              }),
-            }
-          : current.connection_timeline,
         timeline: timeline ?? current.timeline,
         mode: "live",
       }));
-      if (connectionTimeline) {
-        setSelectedConnectionCache((current) => {
-          if (!current) return null;
-          return connectionTimeline.sessions.find((session) => session.id === current.id) ?? current;
-        });
-        setConnectionTimelineOffset(connectionTimeline.offset);
-      }
       if (timeline) setTimelineOffset(timeline.offset);
     } catch {
       setRefreshError("Core 暂时不可用，保留当前画面");
@@ -954,7 +936,7 @@ function App() {
       refreshingRef.current = false;
       setRefreshing(false);
     }
-  }, [activeView, captureScrollSnapshot, captureWorkspaceActive, connectionTimelineRequestPath, snapshot.mode, snapshot.summary.capture_state, showPlaintextFragments, timelineRequestPath]);
+  }, [activeView, captureScrollSnapshot, captureWorkspaceActive, snapshot.mode, snapshot.summary.capture_state, showPlaintextFragments, timelineRequestPath]);
 
   const loadConnectionEvents = useCallback(async (connectionId: string, includePlaintext: boolean) => {
     setConnectionEventsLoadingId(connectionId);
@@ -967,29 +949,18 @@ function App() {
           ...current,
           connection_timeline: {
             ...current.connection_timeline,
-            sessions: current.connection_timeline.sessions.map((item) => item.id === connectionId ? session : item),
+            sessions: current.connection_timeline.sessions.some((item) => item.id === connectionId)
+              ? current.connection_timeline.sessions.map((item) => item.id === connectionId ? session : item)
+              : [...current.connection_timeline.sessions, session],
           },
         }));
       }
     } catch {
-      // Keep the session summary visible if the detail request fails.
+      // Keep the connection summary visible if the detail request fails.
     } finally {
       setConnectionEventsLoadingId(null);
     }
   }, []);
-
-  const toggleConnectionSession = useCallback((session: ConnectionTimeline) => {
-    if (selectedConnectionId === session.id) {
-      setSelectedConnectionId(null);
-      setSelectedConnectionCache(null);
-      return;
-    }
-    setSelectedConnectionId(session.id);
-    setSelectedConnectionCache(session);
-    if (snapshot.mode === "live" && session.event_count > 0 && session.events.length === 0) {
-      void loadConnectionEvents(session.id, showPlaintextFragments);
-    }
-  }, [loadConnectionEvents, selectedConnectionId, showPlaintextFragments, snapshot.mode]);
 
   const applyTimelineFilters = useCallback(() => {
     setTimelinePid(timelinePidInput.trim());
@@ -1056,7 +1027,7 @@ function App() {
       setSelectedConnectionId(null);
       setSelectedConnectionCache(null);
       setSelectedPayloadEntry(null);
-      setConnectionTimelineOffset(0);
+      setSelectedHttpTransaction(null);
       setTimelineOffset(0);
       // Do not hold the button hostage to every read endpoint. The reset
       // command has already completed; refresh the workspace in the
@@ -1105,6 +1076,7 @@ function App() {
           modules: captureModules,
           confirm_plaintext: captureModules.includes("plaintext"),
         });
+        if (captureModules.includes("http")) setActiveView("http");
       } else {
         await postCommand("/api/capture/stop");
       }
@@ -1135,6 +1107,12 @@ function App() {
   }, [captureWorkspaceActive, snapshot.mode, snapshot.summary.capture_state, snapshot.summary.capture_target]);
 
   useEffect(() => {
+    if (snapshot.mode !== "live" || workspaceViewInitializedRef.current) return;
+    workspaceViewInitializedRef.current = true;
+    setActiveView(snapshot.summary.capture_modules.includes("http") ? "http" : "connections");
+  }, [snapshot.mode, snapshot.summary.capture_modules]);
+
+  useEffect(() => {
     if (IS_DESKTOP && desktopBoot.phase !== "ready") return undefined;
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => void refresh(), 1000);
@@ -1142,11 +1120,13 @@ function App() {
   }, [autoRefresh, desktopBoot.phase, refresh]);
 
   useEffect(() => {
-    if (!selectedConnectionId && !selectedPayloadEntry) return undefined;
+    if (!selectedConnectionId && !selectedPayloadEntry && !selectedHttpTransaction) return undefined;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (selectedPayloadEntry) {
           setSelectedPayloadEntry(null);
+        } else if (selectedHttpTransaction) {
+          setSelectedHttpTransaction(null);
         } else {
           setSelectedConnectionId(null);
           setSelectedConnectionCache(null);
@@ -1155,7 +1135,7 @@ function App() {
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [selectedConnectionId, selectedPayloadEntry]);
+  }, [selectedConnectionId, selectedHttpTransaction, selectedPayloadEntry]);
 
   const processNames = useMemo(
     () => new Map(snapshot.processes.map((process) => [process.pid, process.name])),
@@ -1229,21 +1209,30 @@ function App() {
     Math.floor(snapshot.timeline.offset / Math.max(1, snapshot.timeline.limit)),
     timelinePageCount - 1,
   );
-  const connectionTimelinePageSize = Math.max(1, snapshot.connection_timeline.limit);
-  const connectionTimelinePageCount = Math.max(
-    1,
-    Math.ceil(snapshot.connection_timeline.total / connectionTimelinePageSize),
-  );
-  const currentConnectionTimelinePage = Math.min(
-    Math.floor(snapshot.connection_timeline.offset / connectionTimelinePageSize),
-    connectionTimelinePageCount - 1,
-  );
-  const visibleConnectionSessions = useMemo(
-    () => showClosedConnections
-      ? snapshot.connection_timeline.sessions
-      : snapshot.connection_timeline.sessions.filter((session) => session.state !== "closed"),
-    [showClosedConnections, snapshot.connection_timeline.sessions],
-  );
+  const httpTransactions = useMemo(() => pairHttpTransactions(snapshot.timeline.entries), [snapshot.timeline.entries]);
+  const visibleHttpTransactions = useMemo(() => {
+    const query = httpSearch.trim().toLowerCase();
+    return httpTransactions.filter((transaction) => {
+      const status = transaction.response?.http_status ?? null;
+      const matchesStatus = httpStatusFilter === "all"
+        || (httpStatusFilter === "pending" && status === null)
+        || (httpStatusFilter === "success" && status !== null && status >= 200 && status < 300)
+        || (httpStatusFilter === "redirect" && status !== null && status >= 300 && status < 400)
+        || (httpStatusFilter === "error" && status !== null && status >= 400);
+      if (!matchesStatus || !query) return matchesStatus;
+      const request = transaction.request;
+      const response = transaction.response;
+      return [
+        request?.http_method,
+        request?.http_host,
+        request?.http_target,
+        request?.process_name,
+        request?.pid,
+        response?.http_status,
+        response?.http_reason,
+      ].some((value) => String(value ?? "").toLowerCase().includes(query));
+    });
+  }, [httpSearch, httpStatusFilter, httpTransactions]);
   const focusConnection = useCallback((connectionId: string) => {
     setSelectedConnectionId(connectionId);
     const session = snapshot.connection_timeline.sessions.find((item) => item.id === connectionId);
@@ -1268,13 +1257,8 @@ function App() {
     setConnectionSort((current) => nextSortState(current, column));
     setConnectionPageIndex(0);
   }, []);
-  const changeSessionSort = useCallback((column: Exclude<SessionColumnKey, "inspect">) => {
-    setSessionSort((current) => nextSortState(current, column));
-    setConnectionTimelineOffset(0);
-  }, []);
   const processTableWidth = Object.values(processColumnWidths).reduce((total, width) => total + width, 0);
   const connectionTableWidth = Object.values(connectionColumnWidths).reduce((total, width) => total + width, 0);
-  const sessionGridTemplate = Object.values(sessionColumnWidths).map((width) => `${width}px`).join(" ");
   const isLive = snapshot.mode === "live";
   const isCapturing = isLive && snapshot.summary.capture_state === "capturing";
   // The setup console is only for an idle Core. Once Start succeeds, show
@@ -1518,6 +1502,103 @@ function App() {
       {refreshError && <p className="refresh-error workspace-error">{refreshError}</p>}
       {captureError && <p className="refresh-error capture-error workspace-error">{captureError}</p>}
 
+      {activeView === "http" && <section className="panel http-panel">
+        <div className="panel-heading http-heading">
+          <div>
+            <p className="eyebrow">APPLICATION TRAFFIC</p>
+            <h2>HTTP requests</h2>
+            <p className="panel-description">Requests and responses are paired by connection, newest first.</p>
+          </div>
+          <div className="http-toolbar">
+            <input
+              className="http-search"
+              type="search"
+              aria-label="Search HTTP requests"
+              placeholder="Search host, path, process…"
+              value={httpSearch}
+              onChange={(event) => setHttpSearch(event.target.value)}
+            />
+            <select
+              className="http-status-filter"
+              aria-label="Filter HTTP status"
+              value={httpStatusFilter}
+              onChange={(event) => setHttpStatusFilter(event.target.value)}
+            >
+              <option value="all">All statuses</option>
+              <option value="success">2xx Success</option>
+              <option value="redirect">3xx Redirect</option>
+              <option value="error">4xx / 5xx Error</option>
+              <option value="pending">No response</option>
+            </select>
+            <span className="connection-count">{visibleHttpTransactions.length} requests</span>
+          </div>
+        </div>
+        <div className="http-table-wrap">
+          <table className="http-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Method</th>
+                <th>Host / path</th>
+                <th>Status</th>
+                <th>Type</th>
+                <th>Size</th>
+                <th>Duration</th>
+                <th>Process</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleHttpTransactions.length === 0 ? (
+                <tr><td colSpan={8} className="muted empty-cell">
+                  {httpTransactions.length === 0
+                    ? "No HTTP/1.1 requests captured yet. HTTP/2 and HTTP/3 are not decoded currently."
+                    : "No requests match these filters."}
+                </td></tr>
+              ) : visibleHttpTransactions.map((transaction) => {
+                const request = transaction.request;
+                const response = transaction.response;
+                const status = response?.http_status ?? null;
+                const statusClass = status === null ? "pending" : status >= 400 ? "error" : status >= 300 ? "redirect" : "success";
+                const process = request ?? response;
+                return (
+                  <tr
+                    className="http-row"
+                    key={transaction.id}
+                    onClick={() => setSelectedHttpTransaction(transaction)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelectedHttpTransaction(transaction);
+                      }
+                    }}
+                    tabIndex={0}
+                  >
+                    <td className="muted http-nowrap">{formatClock(request?.timestamp_ns ?? response?.timestamp_ns)}</td>
+                    <td><span className={`http-method http-method-${(request?.http_method ?? "unknown").toLowerCase()}`}>{request?.http_method ?? "—"}</span></td>
+                    <td className="http-url-cell">
+                      <strong>{request?.http_host ?? response?.http_host ?? "Unknown host"}</strong>
+                      <span title={request?.http_target ?? undefined}>{request?.http_target ?? "Response without matching request"}</span>
+                    </td>
+                    <td><span className={`http-status http-status-${statusClass}`}>{status ?? "Pending"}</span></td>
+                    <td className="muted">{httpContentType(response)}</td>
+                    <td className="http-nowrap">{formatBytes(response?.http_body_bytes ?? 0)}</td>
+                    <td className="http-nowrap">{httpTransactionDuration(transaction)}</td>
+                    <td className="http-process-cell">
+                      <span>{process?.process_name ?? "unknown"}</span>
+                      <small>{process?.pid !== null && process?.pid !== undefined ? `PID ${process.pid}` : ""}</small>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="http-footer">
+          <span>Showing the latest {snapshot.timeline.entries.length} HTTP messages</span>
+          {snapshot.timeline.has_more && <span>Older messages are available in Raw events.</span>}
+        </div>
+      </section>}
+
       {activeView === "processes" && <section className="content-grid">
         <div className="panel process-panel">
           <div className="panel-heading">
@@ -1587,7 +1668,6 @@ function App() {
                 checked={showClosedConnections}
                 onChange={(event) => {
                   setShowClosedConnections(event.target.checked);
-                  setConnectionTimelineOffset(0);
                   setConnectionPageIndex(0);
                 }}
               />
@@ -1666,83 +1746,6 @@ function App() {
         />
       </section>}
 
-      {activeView === "sessions" && <section className="panel connection-timeline-panel">
-        <div className="panel-heading connection-timeline-heading">
-          <div>
-            <p className="eyebrow">CONNECTION ACTIVITY</p>
-            <h2>Sessions</h2>
-          </div>
-          <span className="connection-count">
-            {showClosedConnections ? `${snapshot.connection_timeline.total} observed` : `${snapshot.connection_timeline.total} active`}
-          </span>
-        </div>
-        <div ref={sessionListRef} className="session-list">
-          <div className="session-list-header" style={{ gridTemplateColumns: sessionGridTemplate }} role="row">
-            <SessionSortableHeader label="Connection" column="route" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("route", clientX)} />
-            <SessionSortableHeader label="State" column="state" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("state", clientX)} />
-            <SessionSortableHeader label="Details" column="details" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("details", clientX)} />
-            <SessionSortableHeader label="Session ID" column="id" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("id", clientX)} />
-            <div className="session-header-cell">
-              <span>Inspect</span>
-              <ColumnResizer label="Inspect" onResizeStart={(clientX) => beginSessionColumnResize("inspect", clientX)} />
-            </div>
-          </div>
-          {visibleConnectionSessions.length === 0 ? (
-            <p className="muted empty-cell">No connection sessions observed yet.</p>
-          ) : visibleConnectionSessions.map((session) => {
-            const processLabel = session.process_name ?? (session.pid ? `exited (${session.pid})` : "unknown process");
-            const remoteLabel = `${session.domain ?? session.remote.address}:${session.remote.port}`;
-            return (
-              <article
-                className="connection-session"
-                style={{ gridTemplateColumns: sessionGridTemplate }}
-                id={`connection-session-${encodeURIComponent(session.id)}`}
-                data-scroll-key={`session:${session.id}`}
-                key={session.id}
-              >
-                <div className="session-heading">
-                  <div className="session-route">
-                    <span className="process-name">{processLabel}</span>
-                    {session.pid !== null && <span className="muted">PID {session.pid}</span>}
-                    <span className="session-arrow">→</span>
-                    <strong>{remoteLabel}</strong>
-                  </div>
-                  <span className={`state state-${session.state}`}>{stateLabel(session.tcp_state ?? session.state)}</span>
-                </div>
-                <div className="session-meta">
-                  <span>{session.protocol.toUpperCase()}</span>
-                  <span>{formatDuration(session.duration_ns)}</span>
-                  <span>↑ {formatBytes(session.sent_bytes)}</span>
-                  <span>↓ {formatBytes(session.received_bytes)}</span>
-                  <span>{session.event_count} events</span>
-                  {(session.tls_sni || session.tls_version) && (
-                    <span className="tls-badge">
-                      TLS {session.tls_sni ?? "—"}{session.tls_version ? ` · ${session.tls_version}` : ""}
-                    </span>
-                  )}
-                </div>
-                <div className="session-id">{session.id} · started {formatTimestamp(session.first_seen_ns, session.first_seen_ns)}</div>
-                <button
-                  className="trace-button"
-                  title={session.id}
-                  onClick={() => toggleConnectionSession(session)}
-                >
-                  Open details
-                </button>
-              </article>
-            );
-          })}
-        </div>
-        <TablePagination
-          pageIndex={currentConnectionTimelinePage}
-          pageCount={connectionTimelinePageCount}
-          totalRows={snapshot.connection_timeline.total}
-          pageSize={connectionTimelinePageSize}
-            loading={false}
-          onPageChange={(page) => setConnectionTimelineOffset(page * connectionTimelinePageSize)}
-        />
-      </section>}
-
       {selectedConnection && (
         <div
           className="modal-backdrop"
@@ -1763,7 +1766,7 @@ function App() {
           >
             <div className="modal-heading">
               <div>
-                <p className="eyebrow">SESSION DETAILS</p>
+                <p className="eyebrow">CONNECTION DETAILS</p>
                 <h2 id="session-modal-title">
                   {selectedConnection.process_name ?? (selectedConnection.pid ? `exited (${selectedConnection.pid})` : "unknown process")}
                   <span className="session-arrow"> → </span>
@@ -1784,7 +1787,7 @@ function App() {
                 </button>
                 <button
                   className="modal-close"
-                  aria-label="Close session details"
+                  aria-label="Close connection details"
                   onClick={() => {
                     setSelectedConnectionId(null);
                     setSelectedConnectionCache(null);
@@ -1803,7 +1806,7 @@ function App() {
               <span>{selectedConnection.event_count} events</span>
             </div>
             {connectionEventsLoadingId === selectedConnection.id ? (
-              <p className="muted session-events-empty">Loading session events…</p>
+              <p className="muted session-events-empty">Loading connection events…</p>
             ) : selectedConnection.events.length === 0 ? (
               <p className="muted session-events-empty">No event details available.</p>
             ) : (
@@ -1841,6 +1844,79 @@ function App() {
                 ))}
               </div>
             )}
+          </section>
+        </div>
+      )}
+
+      {selectedHttpTransaction && (
+        <div
+          className="modal-backdrop http-detail-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setSelectedHttpTransaction(null);
+          }}
+        >
+          <section
+            className="http-detail-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="http-detail-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow">HTTP TRANSACTION</p>
+                <h2 id="http-detail-title">
+                  {selectedHttpTransaction.request?.http_method ?? "Response"}{" "}
+                  {selectedHttpTransaction.request?.http_target ?? selectedHttpTransaction.response?.http_status ?? ""}
+                </h2>
+                <p className="modal-subtitle">
+                  {selectedHttpTransaction.request?.http_host ?? "Unknown host"}
+                  {` · ${selectedHttpTransaction.request?.http_version ?? selectedHttpTransaction.response?.http_version ?? "HTTP"}`}
+                  {` · ${httpTransactionDuration(selectedHttpTransaction)}`}
+                </p>
+              </div>
+              <button className="modal-close" aria-label="Close HTTP transaction" onClick={() => setSelectedHttpTransaction(null)}>×</button>
+            </div>
+            <div className="http-detail-columns">
+              {[selectedHttpTransaction.request, selectedHttpTransaction.response].map((entry, index) => {
+                const direction = index === 0 ? "Request" : "Response";
+                return (
+                  <section className="http-message" key={direction}>
+                    <div className="http-message-heading">
+                      <div>
+                        <span className="http-message-direction">{direction}</span>
+                        <strong>{entry ? payloadTitle(entry) : index === 0 ? "No matching request" : "Waiting for response"}</strong>
+                      </div>
+                      {entry && <button className="ghost-button" onClick={() => setSelectedPayloadEntry(entry)}>Open payload</button>}
+                    </div>
+                    {!entry ? (
+                      <p className="muted http-message-empty">This side of the transaction has not been observed.</p>
+                    ) : (
+                      <>
+                        <dl className="http-message-meta">
+                          <div><dt>Time</dt><dd>{formatClock(entry.timestamp_ns)}</dd></div>
+                          <div><dt>Process</dt><dd>{entry.process_name ?? "unknown"}{entry.pid !== null ? ` (${entry.pid})` : ""}</dd></div>
+                          <div><dt>Captured body</dt><dd>{formatBytes(entry.http_body_bytes ?? 0)}</dd></div>
+                          <div><dt>Content type</dt><dd>{httpContentType(entry)}</dd></div>
+                        </dl>
+                        <details className="http-detail-headers" open>
+                          <summary>Headers ({entry.http_headers?.length ?? 0})</summary>
+                          <pre>{entry.http_headers?.length
+                            ? entry.http_headers.map((header) => `${header.name}: ${header.value}`).join("\n")
+                            : "No headers captured"}</pre>
+                        </details>
+                        {entry.http_body_preview ? (
+                          <pre className="http-detail-body">{entry.http_body_preview}</pre>
+                        ) : (
+                          <p className="muted http-message-empty">{httpBodyEmptyMessage(entry)}</p>
+                        )}
+                      </>
+                    )}
+                  </section>
+                );
+              })}
+            </div>
           </section>
         </div>
       )}
@@ -1974,7 +2050,6 @@ function App() {
                 onChange={(event) => {
                   setShowPlaintextFragments(event.target.checked);
                   setTimelineOffset(0);
-                  setConnectionTimelineOffset(0);
                 }}
               />
               show SSL fragments
