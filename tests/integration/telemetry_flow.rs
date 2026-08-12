@@ -464,6 +464,10 @@ fn parses_http_messages_from_reassembled_plaintext() {
         .entries
         .iter()
         .all(|entry| entry.connection_id.as_deref() == Some(socket_id.as_str())));
+    assert!(page
+        .entries
+        .iter()
+        .all(|entry| entry.http_stream_id.as_deref() == Some(socket_id.as_str())));
     assert_eq!(core.http_stream_count(), 1);
 }
 

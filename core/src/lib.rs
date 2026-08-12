@@ -956,6 +956,7 @@ impl Core {
             .map(|(sequence, message)| {
                 let data = match message {
                     HttpMessage::Request(request) => HttpEventData {
+                        stream_id: Some(stream_key.clone()),
                         direction: HttpMessageDirection::Request,
                         version: request.version.as_str().to_owned(),
                         method: Some(request.method),
@@ -976,6 +977,7 @@ impl Core {
                         payload_skip_reason: request.body.skip_reason,
                     },
                     HttpMessage::Response(response) => HttpEventData {
+                        stream_id: Some(stream_key.clone()),
                         direction: HttpMessageDirection::Response,
                         version: response.version.as_str().to_owned(),
                         method: None,

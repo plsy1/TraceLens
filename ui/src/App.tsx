@@ -97,6 +97,7 @@ type TimelineEntry = {
   plaintext_skipped?: boolean;
   plaintext_skip_reason?: string | null;
   http_direction?: string | null;
+  http_stream_id?: string | null;
   http_version?: string | null;
   http_method?: string | null;
   http_target?: string | null;
@@ -120,6 +121,12 @@ type TimelinePage = {
   offset: number;
   limit: number;
   has_more: boolean;
+};
+
+type HttpTransaction = {
+  id: string;
+  request: TimelineEntry | null;
+  response: TimelineEntry | null;
 };
 
 type ConnectionTimeline = {
@@ -174,7 +181,7 @@ type ProcessColumnKey = ProcessSortKey;
 type ConnectionColumnKey = ConnectionSortKey | "trace";
 type SessionColumnKey = "route" | "state" | "details" | "id" | "inspect";
 type SessionSortKey = Exclude<SessionColumnKey, "inspect"> | "last_seen";
-type WorkspaceView = "processes" | "connections" | "sessions" | "timeline";
+type WorkspaceView = "http" | "processes" | "connections" | "sessions" | "timeline";
 
 type DesktopStatus = {
   core_ready: boolean;
@@ -252,6 +259,7 @@ function closeModuleDependencies(modules: CaptureModule[]): CaptureModule[] {
 }
 
 const workspaceTabs: Array<{ id: WorkspaceView; label: string; hint: string }> = [
+  { id: "http", label: "HTTP requests", hint: "request and response pairs" },
   { id: "connections", label: "Connections", hint: "network edges" },
   { id: "processes", label: "Processes", hint: "live inventory" },
   { id: "sessions", label: "Sessions", hint: "connection activity" },
@@ -681,6 +689,53 @@ function payloadBytes(entry: TimelineEntry): number | null {
   return entry.http_body_bytes ?? entry.plaintext_bytes ?? null;
 }
 
+function pairHttpTransactions(entries: TimelineEntry[]): HttpTransaction[] {
+  const pending = new Map<string, TimelineEntry[]>();
+  const transactions: HttpTransaction[] = [];
+
+  entries
+    .filter((entry) => entry.kind === "http" && entry.http_direction)
+    .sort((left, right) => left.timestamp_ns - right.timestamp_ns)
+    .forEach((entry) => {
+      const key = entry.connection_id ?? entry.http_stream_id ?? `pid:${entry.pid ?? "unknown"}`;
+      if (entry.http_direction === "request") {
+        const requests = pending.get(key) ?? [];
+        requests.push(entry);
+        pending.set(key, requests);
+        return;
+      }
+
+      const request = pending.get(key)?.shift() ?? null;
+      transactions.push({
+        id: request ? `${request.id}:${entry.id}` : entry.id,
+        request,
+        response: entry,
+      });
+    });
+
+  pending.forEach((requests) => {
+    requests.forEach((request) => transactions.push({ id: request.id, request, response: null }));
+  });
+
+  return transactions.sort((left, right) => {
+    const leftTime = left.response?.timestamp_ns ?? left.request?.timestamp_ns ?? 0;
+    const rightTime = right.response?.timestamp_ns ?? right.request?.timestamp_ns ?? 0;
+    return rightTime - leftTime;
+  });
+}
+
+function httpTransactionDuration(transaction: HttpTransaction): string {
+  if (!transaction.request || !transaction.response) return "—";
+  const milliseconds = Math.max(0, transaction.response.timestamp_ns - transaction.request.timestamp_ns) / 1_000_000;
+  if (milliseconds < 1_000) return `${milliseconds.toFixed(milliseconds < 10 ? 1 : 0)} ms`;
+  return `${(milliseconds / 1_000).toFixed(2)} s`;
+}
+
+function httpContentType(entry: TimelineEntry | null): string {
+  const value = entry?.http_headers?.find((header) => header.name.toLowerCase() === "content-type")?.value;
+  return value?.split(";", 1)[0] ?? "—";
+}
+
 function App() {
   const [desktopBoot, setDesktopBoot] = useState<DesktopBootState>(() => IS_DESKTOP
     ? { phase: "starting", message: "Waiting for administrator authorization…" }
@@ -710,6 +765,9 @@ function App() {
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [connectionEventsLoadingId, setConnectionEventsLoadingId] = useState<string | null>(null);
   const [selectedPayloadEntry, setSelectedPayloadEntry] = useState<TimelineEntry | null>(null);
+  const [selectedHttpTransaction, setSelectedHttpTransaction] = useState<HttpTransaction | null>(null);
+  const [httpSearch, setHttpSearch] = useState("");
+  const [httpStatusFilter, setHttpStatusFilter] = useState("all");
   const [processSort, setProcessSort] = useState<SortState<ProcessSortKey>>({ key: "connections", direction: "desc" });
   const [processColumnWidths, setProcessColumnWidths] = useState<Record<ProcessColumnKey, number>>(defaultProcessColumnWidths);
   const [processPageIndex, setProcessPageIndex] = useState(0);
@@ -728,6 +786,7 @@ function App() {
   const connectionTableRef = useRef<HTMLDivElement>(null);
   const sessionListRef = useRef<HTMLDivElement>(null);
   const timelineListRef = useRef<HTMLDivElement>(null);
+  const workspaceViewInitializedRef = useRef(false);
   const pendingScrollSnapshotRef = useRef<ScrollSnapshot | null>(null);
 
   const startDesktopCore = useCallback(async () => {
@@ -888,6 +947,7 @@ function App() {
     ),
     [showPlaintextFragments, timelineConnection, timelineKind, timelineOffset, timelinePid],
   );
+  const httpRequestPath = "/api/timeline?kind=http&limit=200&offset=0&include_plaintext=false";
   const connectionTimelineRequestPath = useMemo(
     () => buildConnectionTimelinePath(connectionTimelineOffset, showClosedConnections, showPlaintextFragments, sessionSort),
     [connectionTimelineOffset, sessionSort, showClosedConnections, showPlaintextFragments],
@@ -907,7 +967,11 @@ function App() {
         activeView === "processes" ? fetchJson<ProcessRow[]>("/api/processes") : Promise.resolve(null),
         activeView === "connections" ? fetchJson<ConnectionRow[]>("/api/connections") : Promise.resolve(null),
         activeView === "sessions" ? fetchJson<ConnectionTimelinePage>(connectionTimelineRequestPath) : Promise.resolve(null),
-        activeView === "timeline" ? fetchJson<TimelinePage>(timelineRequestPath) : Promise.resolve(null),
+        activeView === "timeline"
+          ? fetchJson<TimelinePage>(timelineRequestPath)
+          : activeView === "http"
+            ? fetchJson<TimelinePage>(httpRequestPath)
+            : Promise.resolve(null),
         needsCandidates ? fetchJson<ProcessCandidate[]>('/api/process-candidates') : Promise.resolve(null),
         needsTlsDiagnostics ? fetchJson<RuntimeHealth>('/api/health') : Promise.resolve(null),
       ]);
@@ -1056,6 +1120,7 @@ function App() {
       setSelectedConnectionId(null);
       setSelectedConnectionCache(null);
       setSelectedPayloadEntry(null);
+      setSelectedHttpTransaction(null);
       setConnectionTimelineOffset(0);
       setTimelineOffset(0);
       // Do not hold the button hostage to every read endpoint. The reset
@@ -1105,6 +1170,7 @@ function App() {
           modules: captureModules,
           confirm_plaintext: captureModules.includes("plaintext"),
         });
+        if (captureModules.includes("http")) setActiveView("http");
       } else {
         await postCommand("/api/capture/stop");
       }
@@ -1135,6 +1201,12 @@ function App() {
   }, [captureWorkspaceActive, snapshot.mode, snapshot.summary.capture_state, snapshot.summary.capture_target]);
 
   useEffect(() => {
+    if (snapshot.mode !== "live" || workspaceViewInitializedRef.current) return;
+    workspaceViewInitializedRef.current = true;
+    setActiveView(snapshot.summary.capture_modules.includes("http") ? "http" : "connections");
+  }, [snapshot.mode, snapshot.summary.capture_modules]);
+
+  useEffect(() => {
     if (IS_DESKTOP && desktopBoot.phase !== "ready") return undefined;
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => void refresh(), 1000);
@@ -1142,11 +1214,13 @@ function App() {
   }, [autoRefresh, desktopBoot.phase, refresh]);
 
   useEffect(() => {
-    if (!selectedConnectionId && !selectedPayloadEntry) return undefined;
+    if (!selectedConnectionId && !selectedPayloadEntry && !selectedHttpTransaction) return undefined;
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (selectedPayloadEntry) {
           setSelectedPayloadEntry(null);
+        } else if (selectedHttpTransaction) {
+          setSelectedHttpTransaction(null);
         } else {
           setSelectedConnectionId(null);
           setSelectedConnectionCache(null);
@@ -1155,7 +1229,7 @@ function App() {
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [selectedConnectionId, selectedPayloadEntry]);
+  }, [selectedConnectionId, selectedHttpTransaction, selectedPayloadEntry]);
 
   const processNames = useMemo(
     () => new Map(snapshot.processes.map((process) => [process.pid, process.name])),
@@ -1244,6 +1318,30 @@ function App() {
       : snapshot.connection_timeline.sessions.filter((session) => session.state !== "closed"),
     [showClosedConnections, snapshot.connection_timeline.sessions],
   );
+  const httpTransactions = useMemo(() => pairHttpTransactions(snapshot.timeline.entries), [snapshot.timeline.entries]);
+  const visibleHttpTransactions = useMemo(() => {
+    const query = httpSearch.trim().toLowerCase();
+    return httpTransactions.filter((transaction) => {
+      const status = transaction.response?.http_status ?? null;
+      const matchesStatus = httpStatusFilter === "all"
+        || (httpStatusFilter === "pending" && status === null)
+        || (httpStatusFilter === "success" && status !== null && status >= 200 && status < 300)
+        || (httpStatusFilter === "redirect" && status !== null && status >= 300 && status < 400)
+        || (httpStatusFilter === "error" && status !== null && status >= 400);
+      if (!matchesStatus || !query) return matchesStatus;
+      const request = transaction.request;
+      const response = transaction.response;
+      return [
+        request?.http_method,
+        request?.http_host,
+        request?.http_target,
+        request?.process_name,
+        request?.pid,
+        response?.http_status,
+        response?.http_reason,
+      ].some((value) => String(value ?? "").toLowerCase().includes(query));
+    });
+  }, [httpSearch, httpStatusFilter, httpTransactions]);
   const focusConnection = useCallback((connectionId: string) => {
     setSelectedConnectionId(connectionId);
     const session = snapshot.connection_timeline.sessions.find((item) => item.id === connectionId);
@@ -1517,6 +1615,103 @@ function App() {
 
       {refreshError && <p className="refresh-error workspace-error">{refreshError}</p>}
       {captureError && <p className="refresh-error capture-error workspace-error">{captureError}</p>}
+
+      {activeView === "http" && <section className="panel http-panel">
+        <div className="panel-heading http-heading">
+          <div>
+            <p className="eyebrow">APPLICATION TRAFFIC</p>
+            <h2>HTTP requests</h2>
+            <p className="panel-description">Requests and responses are paired by connection, newest first.</p>
+          </div>
+          <div className="http-toolbar">
+            <input
+              className="http-search"
+              type="search"
+              aria-label="Search HTTP requests"
+              placeholder="Search host, path, process…"
+              value={httpSearch}
+              onChange={(event) => setHttpSearch(event.target.value)}
+            />
+            <select
+              className="http-status-filter"
+              aria-label="Filter HTTP status"
+              value={httpStatusFilter}
+              onChange={(event) => setHttpStatusFilter(event.target.value)}
+            >
+              <option value="all">All statuses</option>
+              <option value="success">2xx Success</option>
+              <option value="redirect">3xx Redirect</option>
+              <option value="error">4xx / 5xx Error</option>
+              <option value="pending">No response</option>
+            </select>
+            <span className="connection-count">{visibleHttpTransactions.length} requests</span>
+          </div>
+        </div>
+        <div className="http-table-wrap">
+          <table className="http-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Method</th>
+                <th>Host / path</th>
+                <th>Status</th>
+                <th>Type</th>
+                <th>Size</th>
+                <th>Duration</th>
+                <th>Process</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleHttpTransactions.length === 0 ? (
+                <tr><td colSpan={8} className="muted empty-cell">
+                  {httpTransactions.length === 0
+                    ? "No HTTP/1.1 requests captured yet. HTTP/2 and HTTP/3 are not decoded currently."
+                    : "No requests match these filters."}
+                </td></tr>
+              ) : visibleHttpTransactions.map((transaction) => {
+                const request = transaction.request;
+                const response = transaction.response;
+                const status = response?.http_status ?? null;
+                const statusClass = status === null ? "pending" : status >= 400 ? "error" : status >= 300 ? "redirect" : "success";
+                const process = request ?? response;
+                return (
+                  <tr
+                    className="http-row"
+                    key={transaction.id}
+                    onClick={() => setSelectedHttpTransaction(transaction)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setSelectedHttpTransaction(transaction);
+                      }
+                    }}
+                    tabIndex={0}
+                  >
+                    <td className="muted http-nowrap">{formatClock(request?.timestamp_ns ?? response?.timestamp_ns)}</td>
+                    <td><span className={`http-method http-method-${(request?.http_method ?? "unknown").toLowerCase()}`}>{request?.http_method ?? "—"}</span></td>
+                    <td className="http-url-cell">
+                      <strong>{request?.http_host ?? response?.http_host ?? "Unknown host"}</strong>
+                      <span title={request?.http_target ?? undefined}>{request?.http_target ?? "Response without matching request"}</span>
+                    </td>
+                    <td><span className={`http-status http-status-${statusClass}`}>{status ?? "Pending"}</span></td>
+                    <td className="muted">{httpContentType(response)}</td>
+                    <td className="http-nowrap">{formatBytes(response?.http_body_bytes ?? 0)}</td>
+                    <td className="http-nowrap">{httpTransactionDuration(transaction)}</td>
+                    <td className="http-process-cell">
+                      <span>{process?.process_name ?? "unknown"}</span>
+                      <small>{process?.pid !== null && process?.pid !== undefined ? `PID ${process.pid}` : ""}</small>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="http-footer">
+          <span>Showing the latest {snapshot.timeline.entries.length} HTTP messages</span>
+          {snapshot.timeline.has_more && <span>Older messages are available in Raw events.</span>}
+        </div>
+      </section>}
 
       {activeView === "processes" && <section className="content-grid">
         <div className="panel process-panel">
@@ -1841,6 +2036,81 @@ function App() {
                 ))}
               </div>
             )}
+          </section>
+        </div>
+      )}
+
+      {selectedHttpTransaction && (
+        <div
+          className="modal-backdrop http-detail-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setSelectedHttpTransaction(null);
+          }}
+        >
+          <section
+            className="http-detail-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="http-detail-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow">HTTP TRANSACTION</p>
+                <h2 id="http-detail-title">
+                  {selectedHttpTransaction.request?.http_method ?? "Response"}{" "}
+                  {selectedHttpTransaction.request?.http_target ?? selectedHttpTransaction.response?.http_status ?? ""}
+                </h2>
+                <p className="modal-subtitle">
+                  {selectedHttpTransaction.request?.http_host ?? "Unknown host"}
+                  {` · ${selectedHttpTransaction.request?.http_version ?? selectedHttpTransaction.response?.http_version ?? "HTTP"}`}
+                  {` · ${httpTransactionDuration(selectedHttpTransaction)}`}
+                </p>
+              </div>
+              <button className="modal-close" aria-label="Close HTTP transaction" onClick={() => setSelectedHttpTransaction(null)}>×</button>
+            </div>
+            <div className="http-detail-columns">
+              {[selectedHttpTransaction.request, selectedHttpTransaction.response].map((entry, index) => {
+                const direction = index === 0 ? "Request" : "Response";
+                return (
+                  <section className="http-message" key={direction}>
+                    <div className="http-message-heading">
+                      <div>
+                        <span className="http-message-direction">{direction}</span>
+                        <strong>{entry ? payloadTitle(entry) : index === 0 ? "No matching request" : "Waiting for response"}</strong>
+                      </div>
+                      {entry && <button className="ghost-button" onClick={() => setSelectedPayloadEntry(entry)}>Open payload</button>}
+                    </div>
+                    {!entry ? (
+                      <p className="muted http-message-empty">This side of the transaction has not been observed.</p>
+                    ) : (
+                      <>
+                        <dl className="http-message-meta">
+                          <div><dt>Time</dt><dd>{formatClock(entry.timestamp_ns)}</dd></div>
+                          <div><dt>Process</dt><dd>{entry.process_name ?? "unknown"}{entry.pid !== null ? ` (${entry.pid})` : ""}</dd></div>
+                          <div><dt>Captured body</dt><dd>{formatBytes(entry.http_body_bytes ?? 0)}</dd></div>
+                          <div><dt>Content type</dt><dd>{httpContentType(entry)}</dd></div>
+                        </dl>
+                        <details className="http-detail-headers" open>
+                          <summary>Headers ({entry.http_headers?.length ?? 0})</summary>
+                          <pre>{entry.http_headers?.length
+                            ? entry.http_headers.map((header) => `${header.name}: ${header.value}`).join("\n")
+                            : "No headers captured"}</pre>
+                        </details>
+                        {entry.http_body_preview ? (
+                          <pre className="http-detail-body">{entry.http_body_preview}</pre>
+                        ) : (
+                          <p className="muted http-message-empty">
+                            {entry.http_payload_skipped ? `Body skipped: ${stateLabel(entry.http_payload_skip_reason ?? "unsupported")}` : "No text body captured."}
+                          </p>
+                        )}
+                      </>
+                    )}
+                  </section>
+                );
+              })}
+            </div>
           </section>
         </div>
       )}

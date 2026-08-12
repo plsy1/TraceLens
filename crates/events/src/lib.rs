@@ -201,6 +201,8 @@ pub struct HttpHeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpEventData {
+    #[serde(default)]
+    pub stream_id: Option<String>,
     pub direction: HttpMessageDirection,
     pub version: String,
     pub method: Option<String>,
@@ -273,6 +275,8 @@ pub enum EventPayload {
         payload_skip_reason: Option<String>,
     },
     Http {
+        #[serde(default)]
+        stream_id: Option<String>,
         direction: HttpMessageDirection,
         version: String,
         method: Option<String>,
@@ -555,6 +559,7 @@ impl TraceEvent {
             connection: None,
             instrumentation: None,
             payload: EventPayload::Http {
+                stream_id: data.stream_id,
                 direction: data.direction,
                 version: data.version,
                 method: data.method,
