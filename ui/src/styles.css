@@ -159,21 +159,7 @@ td { color: #cbd6dc; font-size: 13px; }
 .trace-button:hover { border-color: #6ee7d8; background: rgba(110, 231, 216, .08); }
 .checkbox-label { align-items: center; color: #8495a4; display: flex; font-size: 11px; gap: 6px; }
 .checkbox-label input { accent-color: #6ee7d8; }
-.connection-timeline-panel { height: clamp(560px, calc(100vh - 320px), 760px); display: flex; flex-direction: column; margin-top: 0; }
-.connection-timeline-heading { align-items: center; }
-.session-list { min-height: 0; flex: 1; overflow: auto; overflow-anchor: none; padding: 0 24px 12px; }
-.session-list-header { display: grid; align-items: center; gap: 14px; min-width: 1170px; position: sticky; top: 0; z-index: 3; border-bottom: 1px solid #30414b; background: #121920; }
-.session-header-cell { position: relative; min-width: 0; padding: 9px 0; color: #647582; font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
-.connection-session { display: grid; grid-template-columns: minmax(230px, 1.25fr) auto minmax(330px, 1.8fr) minmax(170px, .8fr) auto; align-items: center; gap: 14px; min-width: 1170px; padding: 12px 0; border-top: 1px solid #202c35; }
-.session-heading { display: contents; }
-.session-route { display: flex; align-items: center; flex-wrap: nowrap; gap: 9px; min-width: 0; overflow: hidden; white-space: nowrap; }
-.session-route .process-name, .session-route strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-route strong { color: #e7edf5; font-size: 14px; font-weight: 600; }
 .session-arrow { color: #6ee7d8; font-size: 18px; }
-.session-meta { display: flex; align-items: center; flex-wrap: nowrap; gap: 10px; min-width: 0; margin-top: 0; overflow: hidden; color: #8495a4; font-size: 11px; white-space: nowrap; }
-.session-meta span { overflow: hidden; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
-.session-id { min-width: 0; margin-top: 0; overflow: hidden; color: #566875; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.connection-session > .trace-button { white-space: nowrap; }
 .session-events { margin-top: 15px; padding: 0 0 0 12px; border-left: 1px solid #30414b; }
 .session-events-empty, .session-events-note { margin: 15px 0 0; font-size: 11px; }
 .session-events-note { padding: 8px 10px; border-radius: 7px; background: #151e25; }

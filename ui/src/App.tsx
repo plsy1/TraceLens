@@ -179,9 +179,7 @@ type ProcessSortKey = "name" | "pid" | "connections" | "traffic";
 type ConnectionSortKey = "process" | "pid" | "remote" | "domain" | "state" | "traffic" | "last_seen";
 type ProcessColumnKey = ProcessSortKey;
 type ConnectionColumnKey = ConnectionSortKey | "trace";
-type SessionColumnKey = "route" | "state" | "details" | "id" | "inspect";
-type SessionSortKey = Exclude<SessionColumnKey, "inspect"> | "last_seen";
-type WorkspaceView = "http" | "processes" | "connections" | "sessions" | "timeline";
+type WorkspaceView = "http" | "processes" | "connections" | "timeline";
 
 type DesktopStatus = {
   core_ready: boolean;
@@ -262,7 +260,6 @@ const workspaceTabs: Array<{ id: WorkspaceView; label: string; hint: string }> =
   { id: "http", label: "HTTP requests", hint: "request and response pairs" },
   { id: "connections", label: "Connections", hint: "network edges" },
   { id: "processes", label: "Processes", hint: "live inventory" },
-  { id: "sessions", label: "Sessions", hint: "connection activity" },
   { id: "timeline", label: "Raw events", hint: "advanced view" },
 ];
 
@@ -282,14 +279,6 @@ const defaultConnectionColumnWidths: Record<ConnectionColumnKey, number> = {
   traffic: 130,
   last_seen: 130,
   trace: 100,
-};
-
-const defaultSessionColumnWidths: Record<SessionColumnKey, number> = {
-  route: 270,
-  state: 110,
-  details: 450,
-  id: 230,
-  inspect: 110,
 };
 
 const demoSummary: Summary = {
@@ -395,24 +384,6 @@ function buildTimelinePath(kind: string, pid: string, connectionId: string, offs
   if (/^\d+$/.test(pid.trim())) params.set("pid", pid.trim());
   if (connectionId.trim()) params.set("connection_id", connectionId.trim());
   return `/api/timeline?${params.toString()}`;
-}
-
-function buildConnectionTimelinePath(
-  offset: number,
-  includeClosed: boolean,
-  includePlaintext: boolean,
-  sort: SortState<SessionSortKey>,
-): string {
-  const params = new URLSearchParams({
-    limit: "20",
-    offset: String(offset),
-    include_closed: String(includeClosed),
-    include_events: "false",
-    include_plaintext: String(includePlaintext),
-    sort: sort.key,
-    direction: sort.direction,
-  });
-  return `/api/connection-timeline?${params.toString()}`;
 }
 
 function buildConnectionDetailPath(connectionId: string, includePlaintext: boolean): string {
@@ -532,31 +503,6 @@ function SortableHeader<Key extends string>({
       </button>
       {onResizeStart && <ColumnResizer label={label} onResizeStart={onResizeStart} />}
     </th>
-  );
-}
-
-function SessionSortableHeader({
-  label,
-  column,
-  sort,
-  onSort,
-  onResizeStart,
-}: {
-  label: string;
-  column: Exclude<SessionColumnKey, "inspect">;
-  sort: SortState<SessionSortKey>;
-  onSort: (column: Exclude<SessionColumnKey, "inspect">) => void;
-  onResizeStart: (clientX: number) => void;
-}) {
-  const active = sort.key === column;
-  return (
-    <div className="session-header-cell" aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
-      <button type="button" className={`sort-button ${active ? "active" : ""}`} onClick={() => onSort(column)}>
-        <span>{label}</span>
-        <span className="sort-indicator" aria-hidden="true">{active ? (sort.direction === "asc" ? "↑" : "↓") : "↕"}</span>
-      </button>
-      <ColumnResizer label={label} onResizeStart={onResizeStart} />
-    </div>
   );
 }
 
@@ -796,9 +742,6 @@ function App() {
   const [processPageIndex, setProcessPageIndex] = useState(0);
   const [connectionSort, setConnectionSort] = useState<SortState<ConnectionSortKey>>({ key: "last_seen", direction: "desc" });
   const [connectionColumnWidths, setConnectionColumnWidths] = useState<Record<ConnectionColumnKey, number>>(defaultConnectionColumnWidths);
-  const [connectionTimelineOffset, setConnectionTimelineOffset] = useState(0);
-  const [sessionColumnWidths, setSessionColumnWidths] = useState<Record<SessionColumnKey, number>>(defaultSessionColumnWidths);
-  const [sessionSort, setSessionSort] = useState<SortState<SessionSortKey>>({ key: "last_seen", direction: "desc" });
   const [connectionPageIndex, setConnectionPageIndex] = useState(0);
   const [timelineOffset, setTimelineOffset] = useState(0);
   const [selectedConnectionCache, setSelectedConnectionCache] = useState<ConnectionTimeline | null>(null);
@@ -807,7 +750,6 @@ function App() {
   const columnResizeCleanupRef = useRef<(() => void) | null>(null);
   const processTableRef = useRef<HTMLDivElement>(null);
   const connectionTableRef = useRef<HTMLDivElement>(null);
-  const sessionListRef = useRef<HTMLDivElement>(null);
   const timelineListRef = useRef<HTMLDivElement>(null);
   const workspaceViewInitializedRef = useRef(false);
   const pendingScrollSnapshotRef = useRef<ScrollSnapshot | null>(null);
@@ -873,34 +815,12 @@ function App() {
     document.body.classList.add("column-resizing");
   }, [connectionColumnWidths]);
 
-  const beginSessionColumnResize = useCallback((column: SessionColumnKey, clientX: number) => {
-    columnResizeCleanupRef.current?.();
-    const startWidth = sessionColumnWidths[column];
-    const handleMove = (event: PointerEvent) => {
-      const nextWidth = Math.max(90, Math.round(startWidth + event.clientX - clientX));
-      setSessionColumnWidths((current) => current[column] === nextWidth
-        ? current
-        : { ...current, [column]: nextWidth });
-    };
-    const cleanup = () => {
-      window.removeEventListener("pointermove", handleMove);
-      window.removeEventListener("pointerup", cleanup);
-      document.body.classList.remove("column-resizing");
-      if (columnResizeCleanupRef.current === cleanup) columnResizeCleanupRef.current = null;
-    };
-    columnResizeCleanupRef.current = cleanup;
-    window.addEventListener("pointermove", handleMove);
-    window.addEventListener("pointerup", cleanup);
-    document.body.classList.add("column-resizing");
-  }, [sessionColumnWidths]);
-
   useEffect(() => () => columnResizeCleanupRef.current?.(), []);
 
   const captureScrollSnapshot = useCallback((): ScrollSnapshot => {
     const containers = [
       processTableRef.current,
       connectionTableRef.current,
-      sessionListRef.current,
       timelineListRef.current,
     ].filter((element): element is HTMLDivElement => element !== null);
 
@@ -971,11 +891,6 @@ function App() {
     [showPlaintextFragments, timelineConnection, timelineKind, timelineOffset, timelinePid],
   );
   const httpRequestPath = "/api/timeline?kind=http&limit=200&offset=0&include_plaintext=false";
-  const connectionTimelineRequestPath = useMemo(
-    () => buildConnectionTimelinePath(connectionTimelineOffset, showClosedConnections, showPlaintextFragments, sessionSort),
-    [connectionTimelineOffset, sessionSort, showClosedConnections, showPlaintextFragments],
-  );
-
   const refresh = useCallback(async () => {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
@@ -985,11 +900,10 @@ function App() {
       const needsCandidates = snapshot.mode !== "live"
         || (snapshot.summary.capture_state === "stopped" && !captureWorkspaceActive);
       const needsTlsDiagnostics = snapshot.summary.capture_state === "capturing" || captureWorkspaceActive;
-      const [summary, processes, connections, connectionTimeline, timeline, candidates, health] = await Promise.all([
+      const [summary, processes, connections, timeline, candidates, health] = await Promise.all([
         fetchJson<Summary>("/api/summary"),
         activeView === "processes" ? fetchJson<ProcessRow[]>("/api/processes") : Promise.resolve(null),
         activeView === "connections" ? fetchJson<ConnectionRow[]>("/api/connections") : Promise.resolve(null),
-        activeView === "sessions" ? fetchJson<ConnectionTimelinePage>(connectionTimelineRequestPath) : Promise.resolve(null),
         activeView === "timeline"
           ? fetchJson<TimelinePage>(timelineRequestPath)
           : activeView === "http"
@@ -1010,28 +924,9 @@ function App() {
         summary,
         processes: processes ?? current.processes,
         connections: connections ?? current.connections,
-        connection_timeline: connectionTimeline
-          ? {
-              ...connectionTimeline,
-              sessions: connectionTimeline.sessions.map((session) => {
-                const previous = current.connection_timeline.sessions.find((item) => item.id === session.id);
-                const previousEvents = previous?.events.filter((event) => showPlaintextFragments || event.kind !== "plaintext") ?? [];
-                return previous && previousEvents.length > session.events.length
-                  ? { ...session, events: previousEvents }
-                  : session;
-              }),
-            }
-          : current.connection_timeline,
         timeline: timeline ?? current.timeline,
         mode: "live",
       }));
-      if (connectionTimeline) {
-        setSelectedConnectionCache((current) => {
-          if (!current) return null;
-          return connectionTimeline.sessions.find((session) => session.id === current.id) ?? current;
-        });
-        setConnectionTimelineOffset(connectionTimeline.offset);
-      }
       if (timeline) setTimelineOffset(timeline.offset);
     } catch {
       setRefreshError("Core 暂时不可用，保留当前画面");
@@ -1041,7 +936,7 @@ function App() {
       refreshingRef.current = false;
       setRefreshing(false);
     }
-  }, [activeView, captureScrollSnapshot, captureWorkspaceActive, connectionTimelineRequestPath, snapshot.mode, snapshot.summary.capture_state, showPlaintextFragments, timelineRequestPath]);
+  }, [activeView, captureScrollSnapshot, captureWorkspaceActive, snapshot.mode, snapshot.summary.capture_state, showPlaintextFragments, timelineRequestPath]);
 
   const loadConnectionEvents = useCallback(async (connectionId: string, includePlaintext: boolean) => {
     setConnectionEventsLoadingId(connectionId);
@@ -1054,29 +949,18 @@ function App() {
           ...current,
           connection_timeline: {
             ...current.connection_timeline,
-            sessions: current.connection_timeline.sessions.map((item) => item.id === connectionId ? session : item),
+            sessions: current.connection_timeline.sessions.some((item) => item.id === connectionId)
+              ? current.connection_timeline.sessions.map((item) => item.id === connectionId ? session : item)
+              : [...current.connection_timeline.sessions, session],
           },
         }));
       }
     } catch {
-      // Keep the session summary visible if the detail request fails.
+      // Keep the connection summary visible if the detail request fails.
     } finally {
       setConnectionEventsLoadingId(null);
     }
   }, []);
-
-  const toggleConnectionSession = useCallback((session: ConnectionTimeline) => {
-    if (selectedConnectionId === session.id) {
-      setSelectedConnectionId(null);
-      setSelectedConnectionCache(null);
-      return;
-    }
-    setSelectedConnectionId(session.id);
-    setSelectedConnectionCache(session);
-    if (snapshot.mode === "live" && session.event_count > 0 && session.events.length === 0) {
-      void loadConnectionEvents(session.id, showPlaintextFragments);
-    }
-  }, [loadConnectionEvents, selectedConnectionId, showPlaintextFragments, snapshot.mode]);
 
   const applyTimelineFilters = useCallback(() => {
     setTimelinePid(timelinePidInput.trim());
@@ -1144,7 +1028,6 @@ function App() {
       setSelectedConnectionCache(null);
       setSelectedPayloadEntry(null);
       setSelectedHttpTransaction(null);
-      setConnectionTimelineOffset(0);
       setTimelineOffset(0);
       // Do not hold the button hostage to every read endpoint. The reset
       // command has already completed; refresh the workspace in the
@@ -1326,21 +1209,6 @@ function App() {
     Math.floor(snapshot.timeline.offset / Math.max(1, snapshot.timeline.limit)),
     timelinePageCount - 1,
   );
-  const connectionTimelinePageSize = Math.max(1, snapshot.connection_timeline.limit);
-  const connectionTimelinePageCount = Math.max(
-    1,
-    Math.ceil(snapshot.connection_timeline.total / connectionTimelinePageSize),
-  );
-  const currentConnectionTimelinePage = Math.min(
-    Math.floor(snapshot.connection_timeline.offset / connectionTimelinePageSize),
-    connectionTimelinePageCount - 1,
-  );
-  const visibleConnectionSessions = useMemo(
-    () => showClosedConnections
-      ? snapshot.connection_timeline.sessions
-      : snapshot.connection_timeline.sessions.filter((session) => session.state !== "closed"),
-    [showClosedConnections, snapshot.connection_timeline.sessions],
-  );
   const httpTransactions = useMemo(() => pairHttpTransactions(snapshot.timeline.entries), [snapshot.timeline.entries]);
   const visibleHttpTransactions = useMemo(() => {
     const query = httpSearch.trim().toLowerCase();
@@ -1389,13 +1257,8 @@ function App() {
     setConnectionSort((current) => nextSortState(current, column));
     setConnectionPageIndex(0);
   }, []);
-  const changeSessionSort = useCallback((column: Exclude<SessionColumnKey, "inspect">) => {
-    setSessionSort((current) => nextSortState(current, column));
-    setConnectionTimelineOffset(0);
-  }, []);
   const processTableWidth = Object.values(processColumnWidths).reduce((total, width) => total + width, 0);
   const connectionTableWidth = Object.values(connectionColumnWidths).reduce((total, width) => total + width, 0);
-  const sessionGridTemplate = Object.values(sessionColumnWidths).map((width) => `${width}px`).join(" ");
   const isLive = snapshot.mode === "live";
   const isCapturing = isLive && snapshot.summary.capture_state === "capturing";
   // The setup console is only for an idle Core. Once Start succeeds, show
@@ -1805,7 +1668,6 @@ function App() {
                 checked={showClosedConnections}
                 onChange={(event) => {
                   setShowClosedConnections(event.target.checked);
-                  setConnectionTimelineOffset(0);
                   setConnectionPageIndex(0);
                 }}
               />
@@ -1884,83 +1746,6 @@ function App() {
         />
       </section>}
 
-      {activeView === "sessions" && <section className="panel connection-timeline-panel">
-        <div className="panel-heading connection-timeline-heading">
-          <div>
-            <p className="eyebrow">CONNECTION ACTIVITY</p>
-            <h2>Sessions</h2>
-          </div>
-          <span className="connection-count">
-            {showClosedConnections ? `${snapshot.connection_timeline.total} observed` : `${snapshot.connection_timeline.total} active`}
-          </span>
-        </div>
-        <div ref={sessionListRef} className="session-list">
-          <div className="session-list-header" style={{ gridTemplateColumns: sessionGridTemplate }} role="row">
-            <SessionSortableHeader label="Connection" column="route" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("route", clientX)} />
-            <SessionSortableHeader label="State" column="state" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("state", clientX)} />
-            <SessionSortableHeader label="Details" column="details" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("details", clientX)} />
-            <SessionSortableHeader label="Session ID" column="id" sort={sessionSort} onSort={changeSessionSort} onResizeStart={(clientX) => beginSessionColumnResize("id", clientX)} />
-            <div className="session-header-cell">
-              <span>Inspect</span>
-              <ColumnResizer label="Inspect" onResizeStart={(clientX) => beginSessionColumnResize("inspect", clientX)} />
-            </div>
-          </div>
-          {visibleConnectionSessions.length === 0 ? (
-            <p className="muted empty-cell">No connection sessions observed yet.</p>
-          ) : visibleConnectionSessions.map((session) => {
-            const processLabel = session.process_name ?? (session.pid ? `exited (${session.pid})` : "unknown process");
-            const remoteLabel = `${session.domain ?? session.remote.address}:${session.remote.port}`;
-            return (
-              <article
-                className="connection-session"
-                style={{ gridTemplateColumns: sessionGridTemplate }}
-                id={`connection-session-${encodeURIComponent(session.id)}`}
-                data-scroll-key={`session:${session.id}`}
-                key={session.id}
-              >
-                <div className="session-heading">
-                  <div className="session-route">
-                    <span className="process-name">{processLabel}</span>
-                    {session.pid !== null && <span className="muted">PID {session.pid}</span>}
-                    <span className="session-arrow">→</span>
-                    <strong>{remoteLabel}</strong>
-                  </div>
-                  <span className={`state state-${session.state}`}>{stateLabel(session.tcp_state ?? session.state)}</span>
-                </div>
-                <div className="session-meta">
-                  <span>{session.protocol.toUpperCase()}</span>
-                  <span>{formatDuration(session.duration_ns)}</span>
-                  <span>↑ {formatBytes(session.sent_bytes)}</span>
-                  <span>↓ {formatBytes(session.received_bytes)}</span>
-                  <span>{session.event_count} events</span>
-                  {(session.tls_sni || session.tls_version) && (
-                    <span className="tls-badge">
-                      TLS {session.tls_sni ?? "—"}{session.tls_version ? ` · ${session.tls_version}` : ""}
-                    </span>
-                  )}
-                </div>
-                <div className="session-id">{session.id} · started {formatTimestamp(session.first_seen_ns, session.first_seen_ns)}</div>
-                <button
-                  className="trace-button"
-                  title={session.id}
-                  onClick={() => toggleConnectionSession(session)}
-                >
-                  Open details
-                </button>
-              </article>
-            );
-          })}
-        </div>
-        <TablePagination
-          pageIndex={currentConnectionTimelinePage}
-          pageCount={connectionTimelinePageCount}
-          totalRows={snapshot.connection_timeline.total}
-          pageSize={connectionTimelinePageSize}
-            loading={false}
-          onPageChange={(page) => setConnectionTimelineOffset(page * connectionTimelinePageSize)}
-        />
-      </section>}
-
       {selectedConnection && (
         <div
           className="modal-backdrop"
@@ -1981,7 +1766,7 @@ function App() {
           >
             <div className="modal-heading">
               <div>
-                <p className="eyebrow">SESSION DETAILS</p>
+                <p className="eyebrow">CONNECTION DETAILS</p>
                 <h2 id="session-modal-title">
                   {selectedConnection.process_name ?? (selectedConnection.pid ? `exited (${selectedConnection.pid})` : "unknown process")}
                   <span className="session-arrow"> → </span>
@@ -2002,7 +1787,7 @@ function App() {
                 </button>
                 <button
                   className="modal-close"
-                  aria-label="Close session details"
+                  aria-label="Close connection details"
                   onClick={() => {
                     setSelectedConnectionId(null);
                     setSelectedConnectionCache(null);
@@ -2021,7 +1806,7 @@ function App() {
               <span>{selectedConnection.event_count} events</span>
             </div>
             {connectionEventsLoadingId === selectedConnection.id ? (
-              <p className="muted session-events-empty">Loading session events…</p>
+              <p className="muted session-events-empty">Loading connection events…</p>
             ) : selectedConnection.events.length === 0 ? (
               <p className="muted session-events-empty">No event details available.</p>
             ) : (
@@ -2265,7 +2050,6 @@ function App() {
                 onChange={(event) => {
                   setShowPlaintextFragments(event.target.checked);
                   setTimelineOffset(0);
-                  setConnectionTimelineOffset(0);
                 }}
               />
               show SSL fragments
