@@ -3,7 +3,7 @@ resolver = "2"
 
 [package]
 name = "tracelens-ui"
-version = "0.0.1"
+version = "0.0.2"
 description = "TraceLens desktop shell"
 authors = ["TraceLens contributors"]
 edition = "2021"

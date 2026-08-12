@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "tracelens-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "brotli",
  "encoding_rs",
@@ -396,14 +396,14 @@ dependencies = [
 
 [[package]]
 name = "tracelens-events"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "tracelens-integration-tests"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde_json",
  "tracelens-core",
