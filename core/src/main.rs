@@ -9,7 +9,11 @@ use tracelens_core::{config::CliOptions, Core};
 // processes. Keep enough bounded headroom for that startup burst without
 // returning to the unbounded memory growth of the old channel.
 const EVENT_QUEUE_CAPACITY: usize = 2_048;
-const EVENT_BATCH_LIMIT: usize = 2_048;
+// Keep the Core mutex available to API readers during a busy global capture.
+// The bounded queue absorbs bursts; smaller batches prevent a full 2,048-event
+// drain from blocking every Web UI refresh for hundreds of milliseconds.
+const EVENT_BATCH_LIMIT: usize = 256;
+const USERSPACE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 fn main() {
     let options = CliOptions::from_args(env::args().skip(1));
@@ -130,7 +134,7 @@ fn run_observer(options: CliOptions) {
             for event in events {
                 core.ingest_event(event);
             }
-            if last_userspace_refresh.elapsed() >= Duration::from_secs(2) {
+            if last_userspace_refresh.elapsed() >= USERSPACE_REFRESH_INTERVAL {
                 core.refresh_userspace_probes();
                 last_userspace_refresh = Instant::now();
             }

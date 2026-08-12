@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use serde::Serialize;
 
@@ -134,7 +135,7 @@ fn inspect_tls_library(
     }
     let symbols = dynamic_symbols(path);
     let provider = classify_provider(path, &symbols)?;
-    let build_id = provider_build_id(path).ok()?;
+    let build_id = cached_provider_build_id(path)?;
     let nss_nspr = (provider == TlsProvider::Nss)
         .then(|| select_nss_nspr(path, available_libraries))
         .flatten();
@@ -444,6 +445,19 @@ fn looks_like_tls_library(path: &Path) -> bool {
 }
 
 fn dynamic_symbols(path: &Path) -> BTreeSet<String> {
+    type CacheEntry = (u64, Option<SystemTime>, BTreeSet<String>);
+    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, CacheEntry>>> = OnceLock::new();
+    let metadata = fs::metadata(path).ok();
+    let length = metadata.as_ref().map_or(0, fs::Metadata::len);
+    let modified = metadata.and_then(|metadata| metadata.modified().ok());
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some((cached_length, cached_modified, symbols)) = cache.get(path) {
+            if *cached_length == length && *cached_modified == modified {
+                return symbols.clone();
+            }
+        }
+    }
     let Ok(output) = Command::new("nm")
         .args(["-D", "--defined-only"])
         .arg(path)
@@ -451,11 +465,36 @@ fn dynamic_symbols(path: &Path) -> BTreeSet<String> {
     else {
         return BTreeSet::new();
     };
-    String::from_utf8_lossy(&output.stdout)
+    let symbols = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.split_whitespace().last())
         .map(|symbol| symbol.split('@').next().unwrap_or(symbol).to_owned())
-        .collect()
+        .collect::<BTreeSet<_>>();
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(path.to_path_buf(), (length, modified, symbols.clone()));
+    }
+    symbols
+}
+
+fn cached_provider_build_id(path: &Path) -> Option<String> {
+    type CacheEntry = (u64, Option<SystemTime>, Option<String>);
+    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, CacheEntry>>> = OnceLock::new();
+    let metadata = fs::metadata(path).ok();
+    let length = metadata.as_ref().map_or(0, fs::Metadata::len);
+    let modified = metadata.and_then(|metadata| metadata.modified().ok());
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some((cached_length, cached_modified, build_id)) = cache.get(path) {
+            if *cached_length == length && *cached_modified == modified {
+                return build_id.clone();
+            }
+        }
+    }
+    let build_id = provider_build_id(path).ok();
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(path.to_path_buf(), (length, modified, build_id.clone()));
+    }
+    build_id
 }
 
 #[cfg(test)]

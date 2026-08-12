@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +41,7 @@ struct MemoryState {
     next_sequence: u64,
     capacity: usize,
     events: VecDeque<MemoryEvent>,
+    event_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,18 +94,23 @@ impl EventStore {
                 let mut state = state
                     .lock()
                     .map_err(|_| "event store lock poisoned".to_owned())?;
-                if let Some(existing) = state
-                    .events
-                    .iter_mut()
-                    .find(|existing| existing.event.id == event.id)
-                {
-                    existing.event = event.clone();
+                if state.event_ids.contains(&event.id) {
+                    if let Some(existing) = state
+                        .events
+                        .iter_mut()
+                        .find(|existing| existing.event.id == event.id)
+                    {
+                        existing.event = event.clone();
+                    }
                 } else {
                     if state.events.len() >= state.capacity {
-                        state.events.pop_front();
+                        if let Some(evicted) = state.events.pop_front() {
+                            state.event_ids.remove(&evicted.event.id);
+                        }
                     }
                     let sequence = state.next_sequence;
                     state.next_sequence = state.next_sequence.saturating_add(1);
+                    state.event_ids.insert(event.id.clone());
                     state.events.push_back(MemoryEvent {
                         sequence,
                         event: event.clone(),
@@ -132,6 +138,7 @@ impl EventStore {
                     .lock()
                     .map_err(|_| "event store lock poisoned".to_owned())?;
                 state.events.clear();
+                state.event_ids.clear();
                 state.next_sequence = 0;
                 Ok(())
             }
@@ -155,12 +162,24 @@ impl EventStore {
     }
 
     pub fn len(&self) -> usize {
-        self.query(EventQuery {
-            limit: 1,
-            ..EventQuery::default()
-        })
-        .map(|page| page.total)
-        .unwrap_or_default()
+        match &self.backend {
+            StoreBackend::Memory(state) => state
+                .lock()
+                .map(|state| state.events.len())
+                .unwrap_or_default(),
+            StoreBackend::Sqlite(connection) => connection
+                .lock()
+                .ok()
+                .and_then(|connection| {
+                    connection
+                        .query_row("SELECT COUNT(*) FROM timeline_events", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .ok()
+                })
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or_default(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -457,9 +476,28 @@ mod tests {
         assert_eq!(page.total, 2);
         assert_eq!(page.events[0].timestamp_ns, 2);
         assert_eq!(page.events[1].timestamp_ns, 3);
+        assert_eq!(store.len(), 2);
 
         store.clear().expect("clear memory store");
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn memory_store_upserts_known_ids_and_forgets_evicted_ids() {
+        let store = EventStore::memory(1);
+        let first = TraceEvent::process_exec(7, "curl", "curl one", 1);
+        let mut updated = first.clone();
+        updated.process.as_mut().expect("process").command_line = Some("curl updated".to_owned());
+        store.try_insert(&first).expect("insert event");
+        store.try_insert(&updated).expect("update event");
+        assert_eq!(store.len(), 1);
+
+        let second = TraceEvent::process_exec(8, "wget", "wget one", 2);
+        store.try_insert(&second).expect("evict first event");
+        store.try_insert(&first).expect("reinsert evicted id");
+        let page = store.query(EventQuery::default()).expect("query events");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.events[0].id, first.id);
     }
 
     #[test]
