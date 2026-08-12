@@ -135,6 +135,9 @@ fn inspect_tls_library(
     let symbols = dynamic_symbols(path);
     let provider = classify_provider(path, &symbols)?;
     let build_id = provider_build_id(path).ok()?;
+    let nss_nspr = (provider == TlsProvider::Nss)
+        .then(|| select_nss_nspr(path, available_libraries))
+        .flatten();
     let (supported, reason) = match provider {
         TlsProvider::OpenSsl | TlsProvider::BoringSsl | TlsProvider::LibreSsl => {
             let required = ["SSL_read", "SSL_write"];
@@ -159,23 +162,11 @@ fn inspect_tls_library(
             )
         }
         TlsProvider::Nss => {
-            let nspr = available_libraries
-                .iter()
-                .find(|library| {
-                    library
-                        .file_name()
-                        .is_some_and(|name| name == "libnspr4.so")
-                })
-                .cloned()
-                .or_else(|| {
-                    let candidate = path.parent()?.join("libnspr4.so");
-                    candidate.is_file().then_some(candidate)
-                });
-            let nspr_symbols = nspr.as_deref().map(dynamic_symbols).unwrap_or_default();
+            let nspr_symbols = nss_nspr.as_deref().map(dynamic_symbols).unwrap_or_default();
             let supported = symbols.contains("SSL_ImportFD")
                 && nspr_symbols.contains("PR_Read")
                 && nspr_symbols.contains("PR_Write")
-                && nspr.is_some();
+                && nss_nspr.is_some();
             (
                 supported,
                 (!supported).then(|| {
@@ -222,19 +213,7 @@ fn inspect_tls_library(
         .filter(|symbol| symbols.contains(**symbol))
         .map(|symbol| (*symbol).to_owned())
         .collect::<Vec<_>>();
-    let auxiliary_libraries = if provider == TlsProvider::Nss {
-        available_libraries
-            .iter()
-            .filter(|library| {
-                library
-                    .file_name()
-                    .is_some_and(|name| name == "libnspr4.so")
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let auxiliary_libraries = nss_nspr.into_iter().collect::<Vec<_>>();
     if provider == TlsProvider::Nss {
         for library in &auxiliary_libraries {
             let auxiliary_symbols = dynamic_symbols(library);
@@ -265,6 +244,21 @@ fn inspect_tls_library(
         supported,
         reason,
     })
+}
+
+fn select_nss_nspr(nss_library: &Path, available_libraries: &BTreeSet<PathBuf>) -> Option<PathBuf> {
+    let sibling = nss_library.parent()?.join("libnspr4.so");
+    if sibling.is_file() || available_libraries.contains(&sibling) {
+        return Some(sibling);
+    }
+    available_libraries
+        .iter()
+        .find(|library| {
+            library
+                .file_name()
+                .is_some_and(|name| name == "libnspr4.so")
+        })
+        .cloned()
 }
 
 fn provider_hooks(provider: TlsProvider) -> &'static [&'static str] {
@@ -466,9 +460,9 @@ fn dynamic_symbols(path: &Path) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_provider, TlsProvider};
+    use super::{classify_provider, select_nss_nspr, TlsProvider};
     use std::collections::BTreeSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn provider_classification_prefers_symbols_over_generic_names() {
@@ -491,6 +485,23 @@ mod tests {
         assert_eq!(
             classify_provider(Path::new("librustls_ffi.so"), &rustls),
             Some(TlsProvider::Rustls)
+        );
+    }
+
+    #[test]
+    fn nss_uses_nspr_from_the_same_runtime_directory() {
+        let libraries = BTreeSet::from([
+            PathBuf::from("/lib/x86_64-linux-gnu/libnspr4.so"),
+            PathBuf::from("/snap/firefox/current/usr/lib/firefox/libnspr4.so"),
+        ]);
+        assert_eq!(
+            select_nss_nspr(
+                Path::new("/snap/firefox/current/usr/lib/firefox/libssl3.so"),
+                &libraries,
+            ),
+            Some(PathBuf::from(
+                "/snap/firefox/current/usr/lib/firefox/libnspr4.so"
+            ))
         );
     }
 }

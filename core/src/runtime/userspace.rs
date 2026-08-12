@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc::Sender, Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use super::{
     bpftime::{provider_probe_specs, BpftimeAttachment, BpftimeRuntime, ProbeSpec},
     probes_for_features,
     provider::{detect_global_tls, detect_process_tls, TlsCapability, TlsProvider},
-    ProbeKind, RuntimeStatus, UserspaceRuntime,
+    EventSender, ProbeKind, RuntimeStatus, UserspaceRuntime,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,13 +41,16 @@ struct KernelUprobeProvider {
     link_count: usize,
     stop_reader: Option<Arc<AtomicBool>>,
     reader: Option<JoinHandle<()>>,
+    raw_events: Arc<AtomicU64>,
+    decoded_events: Arc<AtomicU64>,
+    poll_errors: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
 pub struct KernelUprobeRuntime {
     providers: BTreeMap<String, KernelUprobeProvider>,
     dry_run: bool,
-    event_sender: Option<Sender<TraceEvent>>,
+    event_sender: Option<EventSender>,
 }
 
 impl KernelUprobeRuntime {
@@ -90,6 +93,9 @@ impl KernelUprobeRuntime {
                     link_count,
                     stop_reader: None,
                     reader: None,
+                    raw_events: Arc::new(AtomicU64::new(0)),
+                    decoded_events: Arc::new(AtomicU64::new(0)),
+                    poll_errors: Arc::new(AtomicU64::new(0)),
                 });
             return Ok(attachments);
         }
@@ -181,9 +187,14 @@ impl KernelUprobeRuntime {
             }
         }
 
+        let raw_events = Arc::new(AtomicU64::new(0));
+        let decoded_events = Arc::new(AtomicU64::new(0));
+        let poll_errors = Arc::new(AtomicU64::new(0));
         let (stop_reader, reader) = if let Some(sender) = self.event_sender.clone() {
             if let Some(events) = object.maps().find(|map| map.name() == OsStr::new("events")) {
                 let mut ring_buffer_builder = RingBufferBuilder::new();
+                let callback_raw_events = Arc::clone(&raw_events);
+                let callback_decoded_events = Arc::clone(&decoded_events);
                 let provider = capability.provider.to_string();
                 let library = capability.library.display().to_string();
                 let auxiliary_library = capability
@@ -192,6 +203,7 @@ impl KernelUprobeRuntime {
                     .map(|library| library.display().to_string());
                 ring_buffer_builder
                     .add(&events, move |data| {
+                        callback_raw_events.fetch_add(1, Ordering::Relaxed);
                         if let Some(event) = decode_userspace_event(
                             data,
                             EventSource::Kernel,
@@ -199,7 +211,8 @@ impl KernelUprobeRuntime {
                             &library,
                             auxiliary_library.as_deref(),
                         ) {
-                            let _ = sender.send(event);
+                            callback_decoded_events.fetch_add(1, Ordering::Relaxed);
+                            sender.try_send(event);
                         }
                         0
                     })
@@ -217,9 +230,11 @@ impl KernelUprobeRuntime {
                 })?;
                 let stop = Arc::new(AtomicBool::new(false));
                 let reader_stop = Arc::clone(&stop);
+                let reader_poll_errors = Arc::clone(&poll_errors);
                 let reader = thread::spawn(move || {
                     while !reader_stop.load(Ordering::Relaxed) {
                         if ring_buffer.poll(Duration::from_millis(100)).is_err() {
+                            reader_poll_errors.fetch_add(1, Ordering::Relaxed);
                             break;
                         }
                     }
@@ -244,6 +259,9 @@ impl KernelUprobeRuntime {
                 _links: links,
                 stop_reader,
                 reader,
+                raw_events,
+                decoded_events,
+                poll_errors,
             },
         );
         Ok(attachments)
@@ -285,6 +303,19 @@ impl KernelUprobeRuntime {
             .values()
             .map(|provider| provider.link_count)
             .sum()
+    }
+
+    fn event_diagnostics(&self) -> (u64, u64, u64) {
+        self.providers.values().fold(
+            (0, 0, 0),
+            |(raw_events, decoded_events, poll_errors), provider| {
+                (
+                    raw_events + provider.raw_events.load(Ordering::Relaxed),
+                    decoded_events + provider.decoded_events.load(Ordering::Relaxed),
+                    poll_errors + provider.poll_errors.load(Ordering::Relaxed),
+                )
+            },
+        )
     }
 }
 
@@ -346,7 +377,7 @@ impl ProbeRuntime {
         &self.errors
     }
 
-    pub fn set_event_sender(&mut self, sender: Sender<TraceEvent>) {
+    pub fn set_event_sender(&mut self, sender: EventSender) {
         self.bpftime.set_event_sender(sender.clone());
         self.kernel_uprobe.event_sender = Some(sender);
     }
@@ -581,10 +612,14 @@ impl ProbeRuntime {
     }
 
     pub fn diagnostics(&self) -> UserspaceProbeDiagnostics {
+        let (raw_events, decoded_events, poll_errors) = self.kernel_uprobe.event_diagnostics();
         UserspaceProbeDiagnostics {
             provider_instances: self.kernel_uprobe.provider_count() + self.bpftime.provider_count(),
             readers: self.kernel_uprobe.reader_count() + self.bpftime.reader_count(),
             links: self.kernel_uprobe.link_count() + self.bpftime.link_count(),
+            raw_events,
+            decoded_events,
+            poll_errors,
         }
     }
 
@@ -617,6 +652,9 @@ pub struct UserspaceProbeDiagnostics {
     pub provider_instances: usize,
     pub readers: usize,
     pub links: usize,
+    pub raw_events: u64,
+    pub decoded_events: u64,
+    pub poll_errors: u64,
 }
 
 fn provider_instance_key(provider: TlsProvider, target: &str, pid: u32, build_id: &str) -> String {

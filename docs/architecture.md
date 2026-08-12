@@ -28,8 +28,9 @@ independently.
 - `events`: event bus and correlation entry point.
 - `detection`: rule engine boundary.
 - `storage`: bounded in-memory timeline store by default, with optional SQLite history mode.
-- `runtime`: bpftime CLI/loader integration, ELF build-id Provider identity,
-  shared-object userspace probe lifecycle, and libbpf kernel uProbe fallback.
+- `runtime`: bounded event ingress, bpftime CLI/loader integration, ELF
+  build-id Provider identity, same-runtime NSS/NSPR pairing, shared-object
+  userspace probe lifecycle, and libbpf kernel uProbe fallback.
 - `api`: capture plan/lifecycle, capabilities, process-candidate, read, and connection-session endpoints for the UI.
 
 The provider detector inspects mapped libraries, dynamic symbols, and ELF

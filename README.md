@@ -53,9 +53,11 @@ scripts/        Build and development helpers
 ```
 
 The kernel runtime emits events through BPF ring buffers. The Rust `core`
-process decodes and correlates them, maintains bounded in-memory read models,
-and serves the local API. Userspace probes are loaded through bpftime when
-available, with a kernel-uProbe fallback on Linux.
+process moves them through a bounded, non-blocking ingress queue, decodes and
+correlates them, maintains bounded in-memory read models, and serves the local
+API. Queue drops and userspace ring-buffer delivery counters are exposed by
+`/api/health`. Userspace probes are loaded through bpftime when available,
+with a kernel-uProbe fallback on Linux.
 
 ## Prerequisites
 

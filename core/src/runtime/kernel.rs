@@ -23,6 +23,7 @@ use tracelens_events::{
 
 use crate::capture::{CaptureFeatures, CaptureModule};
 use crate::config::CoreConfig;
+use crate::runtime::EventSender;
 use crate::CaptureScope;
 
 const EVENT_PROCESS_EXEC: u16 = 1;
@@ -204,7 +205,7 @@ pub struct KernelRuntimeController {
 }
 
 impl KernelRuntimeController {
-    pub fn spawn(config: CoreConfig, sender: mpsc::Sender<TraceEvent>) -> Self {
+    pub fn spawn(config: CoreConfig, sender: EventSender) -> Self {
         let (commands, receiver) = mpsc::channel();
         let status = Arc::new(Mutex::new(KernelRuntimeStatus::default()));
         let worker_status = Arc::clone(&status);
@@ -258,7 +259,7 @@ impl KernelRuntimeController {
 
 fn kernel_worker(
     config: CoreConfig,
-    sender: mpsc::Sender<TraceEvent>,
+    sender: EventSender,
     commands: mpsc::Receiver<KernelCommand>,
     status: Arc<Mutex<KernelRuntimeStatus>>,
 ) {
@@ -323,7 +324,7 @@ fn kernel_worker(
 
 fn run_kernel_plan(
     config: &CoreConfig,
-    sender: mpsc::Sender<TraceEvent>,
+    sender: EventSender,
     features: CaptureFeatures,
     target: CaptureScope,
     commands: &mpsc::Receiver<KernelCommand>,
@@ -397,7 +398,7 @@ fn run_kernel_plan(
             .add(events, move |data| {
                 if let Some(event) = decode_process_event(data) {
                     update_process_cache(&cache, &event);
-                    let _ = event_sender.send(event);
+                    event_sender.try_send(event);
                 }
                 0
             })
@@ -411,7 +412,7 @@ fn run_kernel_plan(
                 if let Some(event) =
                     decode_network_event(data, &cache).or_else(|| decode_dns_event(data))
                 {
-                    let _ = event_sender.send(event);
+                    event_sender.try_send(event);
                 }
                 0
             })
@@ -421,7 +422,7 @@ fn run_kernel_plan(
         ring_buffer_builder
             .add(events, move |data| {
                 if let Some(event) = decode_file_event(data) {
-                    let _ = sender.send(event);
+                    sender.try_send(event);
                 }
                 0
             })
@@ -1216,7 +1217,6 @@ mod tests {
     use crate::config::CoreConfig;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
-    use std::sync::mpsc;
 
     #[test]
     fn event_layout_matches_c_abi() {
@@ -1348,7 +1348,7 @@ mod tests {
 
     #[test]
     fn controller_reports_attach_failure_and_can_return_to_idle() {
-        let (sender, _receiver) = mpsc::channel();
+        let (sender, _receiver) = crate::runtime::event_channel(8);
         let config = CoreConfig {
             bpf_object_dir: PathBuf::from("definitely-missing-bpf-objects"),
             ..CoreConfig::default()
