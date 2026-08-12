@@ -689,6 +689,29 @@ function payloadBytes(entry: TimelineEntry): number | null {
   return entry.http_body_bytes ?? entry.plaintext_bytes ?? null;
 }
 
+function httpBodyEmptyMessage(entry: TimelineEntry): string {
+  if (entry.http_payload_skipped) {
+    const reason = entry.http_payload_skip_reason ?? "unsupported";
+    const messages: Record<string, string> = {
+      binary_content: "Binary response body is intentionally hidden.",
+      body_too_large: "Text body exceeds the 64 KB preview limit.",
+      unsupported_content_type: "This response content type is not displayed as text.",
+      unknown_content_type: "The response has no recognizable text content type.",
+      unsupported_content_encoding: "This response uses an unsupported content encoding.",
+      invalid_content_encoding: "The compressed response body could not be decoded.",
+      unsupported_text_encoding: "The response character encoding is not supported.",
+    };
+    return messages[reason] ?? `Body skipped: ${stateLabel(reason)}.`;
+  }
+  if (entry.http_direction === "request" && ["GET", "HEAD", "DELETE", "OPTIONS"].includes(entry.http_method ?? "")) {
+    return `${entry.http_method} requests normally do not contain a body.`;
+  }
+  if (entry.http_content_length === 0 || [204, 304].includes(entry.http_status ?? -1)) {
+    return "This HTTP message has no body.";
+  }
+  return "No text body was captured for this HTTP message.";
+}
+
 function pairHttpTransactions(entries: TimelineEntry[]): HttpTransaction[] {
   const pending = new Map<string, TimelineEntry[]>();
   const transactions: HttpTransaction[] = [];
@@ -2101,9 +2124,7 @@ function App() {
                         {entry.http_body_preview ? (
                           <pre className="http-detail-body">{entry.http_body_preview}</pre>
                         ) : (
-                          <p className="muted http-message-empty">
-                            {entry.http_payload_skipped ? `Body skipped: ${stateLabel(entry.http_payload_skip_reason ?? "unsupported")}` : "No text body captured."}
-                          </p>
+                          <p className="muted http-message-empty">{httpBodyEmptyMessage(entry)}</p>
                         )}
                       </>
                     )}

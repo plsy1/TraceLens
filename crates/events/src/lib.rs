@@ -186,6 +186,16 @@ pub struct PlaintextEventData {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpCaptureEventData {
+    pub ssl_object: u64,
+    pub fd: Option<i32>,
+    pub direction: PlaintextDirection,
+    pub data: Vec<u8>,
+    pub bytes: usize,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpMessageDirection {
@@ -253,6 +263,8 @@ pub enum EventPayload {
         fd: Option<i32>,
         direction: PlaintextDirection,
         data: String,
+        #[serde(skip)]
+        raw_data: Option<Vec<u8>>,
         bytes: usize,
         truncated: bool,
         #[serde(default)]
@@ -266,7 +278,7 @@ pub enum EventPayload {
         ssl_object: u64,
         fd: Option<i32>,
         direction: PlaintextDirection,
-        data: String,
+        data: Vec<u8>,
         bytes: usize,
         truncated: bool,
         #[serde(default)]
@@ -524,6 +536,41 @@ impl TraceEvent {
                 fd: data.fd,
                 direction: data.direction,
                 data: data.data,
+                raw_data: None,
+                bytes: data.bytes,
+                truncated: data.truncated,
+                payload_skipped: false,
+                payload_skip_reason: None,
+            },
+        }
+    }
+
+    pub fn plaintext_bytes(
+        source: EventSource,
+        pid: u32,
+        data: HttpCaptureEventData,
+        timestamp_ns: u64,
+    ) -> Self {
+        let text = String::from_utf8_lossy(&data.data).into_owned();
+        Self {
+            id: format!(
+                "plaintext-{pid}-{}-{direction:?}-{timestamp_ns}",
+                data.ssl_object,
+                direction = data.direction
+            ),
+            timestamp_ns,
+            source,
+            kind: EventKind::Plaintext,
+            pid: Some(pid),
+            process: None,
+            connection: None,
+            instrumentation: None,
+            payload: EventPayload::Plaintext {
+                ssl_object: data.ssl_object,
+                fd: data.fd,
+                direction: data.direction,
+                data: text,
+                raw_data: Some(data.data),
                 bytes: data.bytes,
                 truncated: data.truncated,
                 payload_skipped: false,
@@ -581,7 +628,7 @@ impl TraceEvent {
     pub fn http_capture(
         source: EventSource,
         pid: u32,
-        data: PlaintextEventData,
+        data: HttpCaptureEventData,
         timestamp_ns: u64,
     ) -> Self {
         Self {

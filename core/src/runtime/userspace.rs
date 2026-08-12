@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use libbpf_rs::{Link, MapCore, Object, ObjectBuilder, RingBufferBuilder, UprobeOpts};
 use tracelens_events::{
-    EventSource, PlaintextDirection, PlaintextEventData, TlsEventData, TraceEvent,
+    EventSource, HttpCaptureEventData, PlaintextDirection, TlsEventData, TraceEvent,
 };
 
 use crate::capture::CaptureFeatures;
@@ -760,14 +760,14 @@ fn decode_plaintext_event(
     let payload_size = usize::try_from(event.payload_size).ok()?;
     let captured_size = payload_size.min(PLAINTEXT_MAX_LEN);
     Some(
-        TraceEvent::plaintext(
+        TraceEvent::plaintext_bytes(
             source,
             event.pid,
-            PlaintextEventData {
+            HttpCaptureEventData {
                 ssl_object: event.ssl_object,
                 fd: (event.fd >= 0).then_some(event.fd),
                 direction,
-                data: String::from_utf8_lossy(&event.payload[..captured_size]).into_owned(),
+                data: event.payload[..captured_size].to_vec(),
                 bytes: payload_size,
                 truncated: event.truncated != 0 || payload_size > PLAINTEXT_MAX_LEN,
             },
@@ -798,11 +798,11 @@ fn decode_http_capture_event(
         TraceEvent::http_capture(
             source,
             event.pid,
-            PlaintextEventData {
+            HttpCaptureEventData {
                 ssl_object: event.ssl_object,
                 fd: (event.fd >= 0).then_some(event.fd),
                 direction,
-                data: String::from_utf8_lossy(&event.payload[..captured_size]).into_owned(),
+                data: event.payload[..captured_size].to_vec(),
                 bytes: payload_size,
                 truncated: event.truncated != 0 || payload_size > PLAINTEXT_MAX_LEN,
             },
@@ -985,12 +985,17 @@ mod tests {
         match decoded.payload {
             tracelens_events::EventPayload::Plaintext {
                 data,
+                raw_data,
                 bytes,
                 direction,
                 truncated,
                 ..
             } => {
                 assert!(data.starts_with("hello"));
+                assert_eq!(
+                    raw_data.as_deref().map(|value| &value[..5]),
+                    Some(b"hello".as_slice())
+                );
                 assert_eq!(data.len(), 900);
                 assert_eq!(bytes, 900);
                 assert_eq!(direction, tracelens_events::PlaintextDirection::Write);
@@ -1032,10 +1037,47 @@ mod tests {
         )
         .expect("HTTP capture event");
         assert_eq!(decoded.kind, tracelens_events::EventKind::HttpCapture);
-        assert!(matches!(
-            decoded.payload,
-            tracelens_events::EventPayload::HttpCapture { .. }
-        ));
+        let tracelens_events::EventPayload::HttpCapture { data, .. } = decoded.payload else {
+            panic!("expected HTTP capture payload")
+        };
+        assert_eq!(data, b"GET / HTTP/1.1\r\n\r\n");
+    }
+
+    #[test]
+    fn http_capture_preserves_non_utf8_compressed_bytes() {
+        let event = UserPlaintextEvent {
+            event_type: EVENT_HTTP_CAPTURE,
+            direction: 1,
+            pid: 7,
+            timestamp_ns: 42,
+            ssl_object: 0x1234,
+            fd: 9,
+            payload_size: 6,
+            truncated: 0,
+            payload: {
+                let mut value = [0_u8; PLAINTEXT_MAX_LEN];
+                value[..6].copy_from_slice(&[0x1f, 0x8b, 0x08, 0xff, 0x00, 0x80]);
+                value
+            },
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&event as *const UserPlaintextEvent).cast::<u8>(),
+                std::mem::size_of::<UserPlaintextEvent>(),
+            )
+        };
+        let decoded = decode_userspace_event(
+            bytes,
+            tracelens_events::EventSource::Kernel,
+            "OpenSSL",
+            "/lib/libssl.so",
+            None,
+        )
+        .expect("HTTP capture event");
+        let tracelens_events::EventPayload::HttpCapture { data, .. } = decoded.payload else {
+            panic!("expected HTTP capture payload")
+        };
+        assert_eq!(data, [0x1f, 0x8b, 0x08, 0xff, 0x00, 0x80]);
     }
 
     #[test]

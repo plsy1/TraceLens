@@ -348,6 +348,10 @@ fn is_token(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use flate2::{write::GzEncoder, Compression};
+
     use super::{HttpParseResult, HttpParser};
     use crate::http::{HttpVersion, MAX_HEADER_BYTES};
 
@@ -385,6 +389,28 @@ mod tests {
         assert_eq!(message.status, 200);
         assert_eq!(message.reason, "OK");
         assert_eq!(message.body.preview.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parses_and_decodes_a_gzip_response_body() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(br#"{"ok":true}"#).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            encoded.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&encoded);
+
+        let HttpParseResult::Complete { message, consumed } =
+            HttpParser.parse_response_frame(&response)
+        else {
+            panic!("gzip response should parse")
+        };
+        assert_eq!(consumed, response.len());
+        assert_eq!(message.body.preview.as_deref(), Some(r#"{"ok":true}"#));
+        assert!(!message.body.skipped);
     }
 
     #[test]

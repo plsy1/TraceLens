@@ -930,26 +930,31 @@ impl Core {
                 fd,
                 direction,
                 data,
+                raw_data,
                 truncated,
                 ..
-            }
-            | EventPayload::HttpCapture {
+            } => (
+                ssl_object,
+                fd,
+                direction,
+                raw_data.as_deref().unwrap_or(data.as_bytes()),
+                truncated,
+            ),
+            EventPayload::HttpCapture {
                 ssl_object,
                 fd,
                 direction,
                 data,
                 truncated,
                 ..
-            } => (ssl_object, fd, direction, data, truncated),
+            } => (ssl_object, fd, direction, data.as_slice(), truncated),
             _ => return Vec::new(),
         };
         let stream_key = http_stream_key(event, pid, *ssl_object, *fd);
         let Some(stream_key) = stream_key else {
             return Vec::new();
         };
-        let messages = self
-            .http
-            .observe(&stream_key, *direction, data.as_bytes(), *truncated);
+        let messages = self.http.observe(&stream_key, *direction, data, *truncated);
         messages
             .into_iter()
             .enumerate()
@@ -1044,11 +1049,17 @@ impl Core {
         match &mut event.payload {
             EventPayload::Plaintext {
                 data,
+                raw_data,
                 payload_skipped,
                 payload_skip_reason,
                 ..
+            } => {
+                data.clear();
+                *raw_data = None;
+                *payload_skipped = true;
+                *payload_skip_reason = Some(reason.to_owned());
             }
-            | EventPayload::HttpCapture {
+            EventPayload::HttpCapture {
                 data,
                 payload_skipped,
                 payload_skip_reason,

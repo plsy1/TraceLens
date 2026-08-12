@@ -20,8 +20,9 @@ traffic, and stop or reset the session when finished.
 - Keeps capture data in memory by default. SQLite history is opt-in.
 
 Payload capture is intentionally bounded. Small textual HTTP bodies such as
-HTML, JSON, XML, JavaScript, and CSS can be previewed; large, binary, media,
-archive, or compressed content is represented by metadata and byte counts.
+HTML, JSON, XML, JavaScript, and CSS can be previewed. TraceLens decodes bounded
+gzip, deflate, Brotli, and Zstandard responses; large, binary, media, archive,
+or unsupported encoded content is represented by metadata and byte counts.
 
 ## Capture profiles and modules
 

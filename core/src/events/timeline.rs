@@ -327,6 +327,7 @@ impl TimelineEntry {
                 truncated,
                 payload_skipped,
                 payload_skip_reason,
+                ..
             } => {
                 if let Some(connection) = event.connection.as_ref() {
                     entry.connection_id = Some(connection.id.clone());
@@ -368,7 +369,7 @@ impl TimelineEntry {
                 entry.ssl_object = Some(ssl_object);
                 entry.fd = fd;
                 entry.plaintext_direction = Some(direction);
-                entry.plaintext = Some(data);
+                entry.plaintext = Some(String::from_utf8_lossy(&data).into_owned());
                 entry.plaintext_bytes = Some(bytes);
                 entry.plaintext_truncated = truncated;
                 entry.plaintext_skipped = payload_skipped;
